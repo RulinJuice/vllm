@@ -86,6 +86,8 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.ple.reader import PLEReader
+from vllm.v1.ple.types import PLEPool
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -217,6 +219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
+        self.ple_reader: PLEReader | None = None
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -1225,10 +1228,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
+    def initialize_ple_pool(self, pool: PLEPool) -> None:
+        from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+            Qwen4ExpPLEStagedEmbedding,
+        )
+
+        (embedding,) = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, Qwen4ExpPLEStagedEmbedding)
+        ]
+        self.ple_reader = PLEReader(pool, embedding.rows, embedding.rows_ready)
+
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        if self.ple_reader is not None:
+            self.ple_reader.remove_request(req_id)
         self.draft_tokens_handler.discard(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
@@ -1311,6 +1328,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
+            if self.ple_reader is not None:
+                assert new_req_data.ple_result is not None
+                self.ple_reader.attach(req_id, new_req_data.ple_result)
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
@@ -1917,6 +1937,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            if self.ple_reader is not None:
+                self.ple_reader.stage(input_batch)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -2157,6 +2179,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self.ple_reader is not None:
+            self.ple_reader.finish_forward()
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2466,6 +2490,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self.ple_reader is not None:
+            self.ple_reader.close()
+            self.ple_reader = None
         if current_platform.is_rocm():
             # RCCL's ncclCommAbort waits for live graphs that captured the comm:
             # https://github.com/ROCm/rocm-systems/issues/13018

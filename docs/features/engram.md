@@ -131,6 +131,41 @@ Costs and limits:
   `instanttensor`, or `--safetensors-load-strategy eager`);
   `--load-format dummy` serves zeros.
 
+## Scheduler-side prefill (Qwen4Exp)
+
+Set `prefill_ple_pool_bytes` on the prefill instance to enable scheduler-side
+PLE with a local DRAM table.
+
+```bash
+vllm serve <qwen4exp-checkpoint> \
+  --distributed-executor-backend mp \
+  --engram-config '{"prefill_ple_pool_bytes": 268435456, "prefill_ple_timeout": 30}'
+```
+
+EngineCore loads one table and prepares rows in a background thread after
+the scheduler establishes the reusable KV prefix. Requests can wait for their
+rows while other requests run. The TP workers map the same result pool and
+copy the current batch's rows to their GPUs. The PLE layer waits for the
+copy when it consumes the rows.
+
+This mode requires Linux CUDA, Model Runner V2, one Qwen4Exp PLE table in
+a BF16 or FP8 safetensors checkpoint, and single-node tensor parallelism
+with `mp` or `uni`. Submit text prompts with `max_tokens=1` and disable
+speculative decoding. Use the regular PLE backend on the decode instance.
+Local prefix caching and asynchronous external KV loads can reduce the
+range prepared for a prompt. A synchronous external KV hit returns a
+request error.
+
+Size the result pool for the prompt suffixes that can wait or run at the
+same time. Each prepared token takes `ple_embed_dim` elements in the
+checkpoint dtype. The pool uses `/dev/shm` and is registered for CUDA DMA
+once per worker. A suffix larger than the pool fails immediately. The
+`prefill_ple_timeout` value bounds the wait for rows or pool space in
+seconds and defaults to 30.
+
+See the [scheduler-side PLE design](../design/ple_connector.md) for the
+provider contract and buffer lifecycle.
+
 ## Data-parallel topologies (DeepSeek V4.1)
 
 By default (`embedding_across_dp: false`), each DP replica keeps its own

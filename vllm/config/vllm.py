@@ -1602,6 +1602,31 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
+        if self.engram_config.prefill_ple_pool_bytes is not None:
+            assert model_config is not None
+            if (
+                not self.use_v2_model_runner
+                or self.is_mm_encoder_only
+                or speculative_config is not None
+                or self.parallel_config.use_ubatching
+                or self.weight_transfer_config is not None
+                or self.cache_config.kv_sharing_fast_prefill
+                or model_config.runner_type != "generate"
+            ):
+                raise ValueError(
+                    "Scheduler-side PLE requires MRV2 generation without "
+                    "speculation, microbatching, fast prefill, or live weight updates"
+                )
+            if self.load_config.load_format not in ("auto", "hf", "safetensors"):
+                raise ValueError("Scheduler-side PLE requires a safetensors checkpoint")
+            extra_config = self.load_config.model_loader_extra_config
+            if (
+                self.load_config.safetensors_load_strategy not in (None, "lazy")
+                or not isinstance(extra_config, dict)
+                or extra_config.get("enable_multithread_load")
+            ):
+                raise ValueError("Scheduler-side PLE requires lazy safetensors loading")
+            self.load_config.safetensors_load_strategy = "lazy"
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def _reject_mismatched_float_kv_cache(self) -> None:

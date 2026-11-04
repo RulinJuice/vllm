@@ -3,7 +3,7 @@
 
 from typing import TYPE_CHECKING, Self
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from vllm.config.utils import config, get_hash_factors, hash_factors
 
@@ -42,6 +42,12 @@ class EngramConfig:
     rows on the host instead of allocating the table. Takes precedence over
     cpu_offload."""
 
+    prefill_ple_pool_bytes: int | None = Field(default=None, gt=0)
+    """Enable scheduler-side PLE with this shared result capacity in bytes."""
+
+    prefill_ple_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    """Seconds a request can wait for scheduler-side PLE rows."""
+
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
@@ -63,6 +69,13 @@ class EngramConfig:
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
+        if self.prefill_ple_pool_bytes is not None and (
+            self.disk_offload
+            or self.embedding_across_dp
+            or self.dp_shared_memory
+            or self.use_thp
+        ):
+            raise ValueError("Scheduler-side PLE requires its own table backend")
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
@@ -92,6 +105,17 @@ class EngramConfig:
 
             if field != "ple_layer_ids" or not current_platform.is_cuda():
                 raise ValueError("disk_offload requires a Qwen4Exp model on CUDA")
+        if self.prefill_ple_pool_bytes is not None:
+            from vllm.platforms import current_platform
+
+            if (
+                field != "ple_layer_ids"
+                or not current_platform.is_cuda()
+                or len(model_config.hf_text_config.ple_layer_ids) != 1
+            ):
+                raise ValueError(
+                    "Scheduler-side PLE requires CUDA Qwen4Exp with one table"
+                )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
@@ -105,6 +129,18 @@ class EngramConfig:
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if self.prefill_ple_pool_bytes is not None and (
+            parallel_config.nnodes != 1
+            or parallel_config.data_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+            or parallel_config.enable_elastic_ep
+            or parallel_config.distributed_executor_backend not in ("mp", "uni")
+        ):
+            raise ValueError(
+                "Scheduler-side PLE requires single-node TP with mp or uni"
+            )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")

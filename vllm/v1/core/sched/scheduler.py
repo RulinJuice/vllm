@@ -73,6 +73,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.ple.connector import PLEConnector
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -83,6 +84,8 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    ple_connector: PLEConnector | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -262,6 +265,7 @@ class Scheduler(SchedulerInterface):
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
+        self.ple_request_errors: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
 
         # Encoder-related.
@@ -1337,6 +1341,36 @@ class Scheduler(SchedulerInterface):
                             request, num_computed_tokens, window_loaded
                         )
                         num_computed_tokens -= num_replay_tokens
+                    if self.ple_connector is not None:
+                        # This runs after APC and after asynchronous KV receive.
+                        # A synchronous external hit needs this step to load KV.
+                        if num_external_computed_tokens:
+                            self.ple_request_errors[request_id] = RequestError(
+                                code="validation_error",
+                                message=(
+                                    "Scheduler-side PLE requires asynchronous KV loads"
+                                ),
+                            )
+                        if request_id in self.ple_request_errors:
+                            skip_request(request_queue)
+                            continue
+                        assert request.prompt_token_ids is not None
+                        try:
+                            ple_ready = self.ple_connector.ensure_ready(
+                                request_id,
+                                request.prompt_token_ids,
+                                num_computed_tokens,
+                            )
+                        except (ValueError, RuntimeError, TimeoutError) as exc:
+                            self.ple_request_errors[request_id] = RequestError(
+                                code="ple_lookup_failed",
+                                message=str(exc),
+                                retryable=isinstance(exc, TimeoutError),
+                            )
+                            ple_ready = False
+                        if not ple_ready:
+                            skip_request(request_queue)
+                            continue
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -1693,6 +1727,9 @@ class Scheduler(SchedulerInterface):
                 )
                 for req in scheduled_new_reqs
             ]
+            if self.ple_connector is not None:
+                for data in new_reqs_data:
+                    data.ple_result = self.ple_connector.dispatch(data.req_id)
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
@@ -2602,6 +2639,9 @@ class Scheduler(SchedulerInterface):
 
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
+        if self.ple_connector is not None:
+            request_errors.update(self.ple_request_errors)
+            self.ple_request_errors.clear()
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
@@ -3118,6 +3158,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.ple_connector is not None:
+            self.ple_connector.finish(request.request_id)
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
@@ -3259,6 +3301,7 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
+            or (self.ple_connector is not None and self.ple_connector.has_cleanup)
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
@@ -3408,6 +3451,9 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.ple_connector is not None:
+            self.ple_connector.close()
+            self.ple_connector = None
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -3600,6 +3646,13 @@ class Scheduler(SchedulerInterface):
         elif request.num_computed_tokens == request.num_tokens:
             request.num_computed_tokens = request.num_tokens - 1
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        if self.ple_connector is not None:
+            logger.debug(
+                "PLE KV load finished request=%s compute_start=%d failed=%s",
+                request.request_id,
+                request.num_computed_tokens,
+                load_failed,
+            )
 
     def _handle_blocked_waiting_request(self, request: Request) -> bool:
         """Returns True if scheduling of this request should proceed, False if

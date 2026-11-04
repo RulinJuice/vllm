@@ -80,6 +80,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.ple.types import PLE_TABLE_SHARD
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -148,6 +149,12 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_weight_scale",
     "_input_scale",
 ]
+
+
+def _is_ple_table_shard(name: str) -> bool:
+    suffix = name.rpartition(".ple_embedding.")[2]
+    return PLE_TABLE_SHARD.fullmatch(suffix) is not None
+
 
 # The checkpoint stores these projections separately; runtime packs each group
 # into adjacent logical shards of a MergedColumnParallelLinear.
@@ -726,6 +733,9 @@ class Qwen4ExpForCausalLM(
         self.quant_config = vllm_config.quant_config
         self.config = config
         self.scheduler_config = vllm_config.scheduler_config
+        engram = vllm_config.engram_config
+        if engram is not None and engram.prefill_ple_pool_bytes is not None:
+            self.is_unused_checkpoint_weight = _is_ple_table_shard
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -1030,6 +1040,9 @@ class Qwen4ExpForConditionalGeneration(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
+        self.is_unused_checkpoint_weight = getattr(
+            self.language_model, "is_unused_checkpoint_weight", None
+        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors

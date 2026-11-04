@@ -111,6 +111,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.ple.connector import PLEConnector
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
@@ -133,6 +134,7 @@ class EngineCore:
     _checkpoint_state = CheckpointState.RUNNING
     _checkpoint_error: str | None = None
     _kv_cache_reclaimable = False
+    ple_connector: PLEConnector | None = None
 
     def __init__(
         self,
@@ -177,7 +179,7 @@ class EngineCore:
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        scheduler_cls = vllm_config.scheduler_config.get_scheduler_cls()
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
@@ -190,7 +192,7 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
-        self.scheduler: SchedulerInterface = Scheduler(
+        scheduler = scheduler_cls(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
@@ -199,7 +201,25 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        self.scheduler: SchedulerInterface = scheduler
         self._initialize_effective_attention_block_size()
+        engram = vllm_config.engram_config
+        if engram is not None and engram.prefill_ple_pool_bytes is not None:
+            from vllm.v1.core.sched.scheduler import Scheduler
+            from vllm.v1.ple.qwen4 import load_qwen4_connector
+
+            if not isinstance(scheduler, Scheduler):
+                raise ValueError("Scheduler-side PLE requires the V1 scheduler")
+            ple_connector = load_qwen4_connector(vllm_config)
+            try:
+                self.model_executor.collective_rpc(
+                    "initialize_ple_pool", args=(ple_connector.pool,)
+                )
+            except BaseException:
+                ple_connector.close()
+                raise
+            self.ple_connector = ple_connector
+            scheduler.ple_connector = ple_connector
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -706,6 +726,15 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _reclaim_ple_results(self) -> None:
+        connector = self.ple_connector
+        if connector is not None and (result_ids := connector.cleanup_ids()):
+            acknowledgements = self.model_executor.collective_rpc(
+                "acknowledge_ple_results", args=(result_ids,)
+            )
+            assert acknowledgements
+            connector.reclaim(list(set(result_ids).intersection(*acknowledgements)))
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -714,6 +743,7 @@ class EngineCore:
         """
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        self._reclaim_ple_results()
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
@@ -770,6 +800,7 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
+        self._reclaim_ple_results()
 
         model_executed = False
         deferred_scheduler_output = None
@@ -879,6 +910,7 @@ class EngineCore:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
+        self.ple_connector = None
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
@@ -1227,6 +1259,21 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if (
+            self.ple_connector is not None
+            and not request.abort_immediately
+            and (
+                not request.prompt_token_ids
+                or request.prompt_embeds is not None
+                or request.mm_features
+                or request.resumable
+                or request.sampling_params is None
+                or request.sampling_params.max_tokens != 1
+            )
+        ):
+            raise VLLMValidationError(
+                "Scheduler-side PLE requires a text prompt with max_tokens=1"
+            )
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.

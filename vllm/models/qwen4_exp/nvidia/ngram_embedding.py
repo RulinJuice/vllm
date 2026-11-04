@@ -12,6 +12,7 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_etp_group, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -21,6 +22,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter, sp_shard
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
@@ -58,6 +60,74 @@ def _maps_entry(ptr: int) -> tuple[str, int]:
                 path = fields[5].rstrip("\n") if len(fields) > 5 else ""
                 return path, ptr - low + int(fields[2], 16)
     return "", 0
+
+
+def _read_ple_rows(
+    rows: torch.Tensor, hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    embedding = layer.ple_embedding.ngram_embedding
+    embedding.rows_ready.wait()
+    # Keep the read inside the op. Modeling this as an in-place wait lets
+    # compiler functionalization clone the rows before the event is ready.
+    return rows.clone()
+
+
+def _read_ple_rows_fake(
+    rows: torch.Tensor, hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    return torch.empty_like(rows)
+
+
+direct_register_custom_op(
+    op_name="read_ple_rows",
+    op_func=_read_ple_rows,
+    fake_impl=_read_ple_rows_fake,
+)
+
+
+class Qwen4ExpPLEStagedEmbedding(Qwen4ExpPLEEmbedding):
+    """Fixed device rows supplied by the scheduler-side PLE connector."""
+
+    weight: nn.Parameter
+
+    def __init__(
+        self,
+        *args,
+        prefix: str,
+        num_ngram_heads: int,
+        max_total_tokens: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, prefix=prefix, **kwargs)
+        if self.weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("Scheduler-side PLE requires BF16 or FP8 table rows")
+        self.rows = self.weight.new_zeros(
+            (max_total_tokens, num_ngram_heads * self.weight.shape[1])
+        )
+        # Capture the wait as an event node that observes recordings at replay.
+        self.rows_ready = torch.cuda.Event(external=True)
+        self.rows_ready.record()
+        self.layer_name = prefix.removesuffix(".ple_embedding.ngram_embedding")
+
+    def allocate_embedding_weight(
+        self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        return torch.empty((0, embedding_dim), dtype=dtype)
+
+    def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
+        raise NotImplementedError
+
+    def staged_rows(self, hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        rows = self.rows[:num_tokens]
+        if torch.compiler.is_compiling():
+            # The hidden-state input orders the read after earlier layers.
+            return torch.ops.vllm.read_ple_rows(rows, hidden_states, self.layer_name)
+        self.rows_ready.wait()
+        return rows
 
 
 class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
@@ -432,18 +502,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
         embedding_cls = (
-            Qwen4ExpPLEDiskOffloadEmbedding
+            Qwen4ExpPLEStagedEmbedding
+            if engram_config is not None
+            and engram_config.prefill_ple_pool_bytes is not None
+            else Qwen4ExpPLEDiskOffloadEmbedding
             if engram_config is not None and engram_config.disk_offload
             else Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
-        # Disk-offload ranks hold full rows, so they only shard tokens.
+        # Staged rows are complete on each rank, so those ranks only shard tokens.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
             and get_etp_group().world_size == get_tp_group().world_size
-            and embedding_cls is not Qwen4ExpPLEDiskOffloadEmbedding
+            and embedding_cls
+            not in (Qwen4ExpPLEDiskOffloadEmbedding, Qwen4ExpPLEStagedEmbedding)
         )
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
@@ -611,6 +685,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
         elif isinstance(embedding, Qwen4ExpPLEDiskOffloadEmbedding):
             embeddings = embedding.staged_rows(input_ids.shape[0])
+        elif isinstance(embedding, Qwen4ExpPLEStagedEmbedding):
+            embeddings = embedding.staged_rows(hidden_states, input_ids.shape[0])
         else:
             ngram_ids = self.compute_ngram_ids(
                 input_ids, query_start_loc, ngram_context
@@ -707,7 +783,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     embedding.accept_checkpoint_shard(
                         shard_index, loaded_weight, shard_size, suffix
                     )
-                else:
+                elif not isinstance(embedding, Qwen4ExpPLEStagedEmbedding):
                     parameter.weight_loader(
                         parameter,
                         loaded_weight,
@@ -715,6 +791,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     )
                 loaded.add(f"ngram_embedding.{suffix}")
                 continue
+            if (
+                isinstance(embedding, Qwen4ExpPLEStagedEmbedding)
+                and name == "ngram_embedding.weight"
+            ):
+                raise ValueError("Scheduler-side PLE requires checkpoint table shards")
             if nvfp4_method is not None and name in (
                 "ngram_embedding.weight",
                 "ngram_embedding.weight_scale",

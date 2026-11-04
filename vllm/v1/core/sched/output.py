@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.utils.gc_utils import untrack_long_lists
+from vllm.v1.ple.types import PLEResult
 
 if TYPE_CHECKING:
     import numpy as np
@@ -55,6 +56,7 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    ple_result: PLEResult | None = None
 
     @classmethod
     def from_request(

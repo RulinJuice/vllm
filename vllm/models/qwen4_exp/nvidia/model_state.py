@@ -42,6 +42,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
         if self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1.")
         self.ngram_eos_token_id = int(config.eos_token_id)
+        engram = vllm_config.engram_config
+        self.uses_staged_ple = (
+            engram is not None and engram.prefill_ple_pool_bytes is not None
+        )
         # PLE runs inside captured regions, so these buffers keep a fixed shape
         # and address as the active request count changes between replays.
         self.ngram_context = torch.full(
@@ -103,6 +107,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if not self.uses_ngram_embedding:
+            return model_inputs
+        if self.uses_staged_ple:
+            # PLE keeps these forward arguments for the shared model interface.
+            # The staged embedding consumes rows instead of hashing on GPU.
+            model_inputs.update(
+                query_start_loc=self.ple_query_start_loc,
+                ngram_context=self.ngram_context,
+            )
             return model_inputs
 
         num_reqs_padded = input_batch.num_reqs_after_padding
