@@ -43,9 +43,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             raise ValueError("N-gram embedding requires context length >= 1.")
         self.ngram_eos_token_id = int(config.eos_token_id)
         engram = vllm_config.engram_config
-        self.uses_staged_ple = (
-            engram is not None and engram.prefill_ple_pool_bytes is not None
-        )
+        self.uses_staged_ple = engram is not None and engram.prefill_ple_enabled
         # PLE runs inside captured regions, so these buffers keep a fixed shape
         # and address as the active request count changes between replays.
         self.ngram_context = torch.full(

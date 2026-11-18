@@ -23,6 +23,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.ple.output import PLEOutputAggregator
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
@@ -121,6 +122,7 @@ class Executor(ABC):
         self.sleeping_tags: set[str] = set()
         self.kv_output_aggregator: KVOutputAggregator | None = None
         self.ec_output_aggregator: ECOutputAggregator | None = None
+        self.ple_output_aggregator: PLEOutputAggregator | None = None
 
     @abstractmethod
     def _init_executor(self) -> None:

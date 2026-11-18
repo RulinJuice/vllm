@@ -204,8 +204,9 @@ class EngineCore:
         self.scheduler: SchedulerInterface = scheduler
         self._initialize_effective_attention_block_size()
         engram = vllm_config.engram_config
-        if engram is not None and engram.prefill_ple_pool_bytes is not None:
+        if engram is not None and engram.prefill_ple_enabled:
             from vllm.v1.core.sched.scheduler import Scheduler
+            from vllm.v1.ple.output import PLEOutputAggregator
             from vllm.v1.ple.qwen4 import load_qwen4_connector
 
             if not isinstance(scheduler, Scheduler):
@@ -213,13 +214,16 @@ class EngineCore:
             ple_connector = load_qwen4_connector(vllm_config)
             try:
                 self.model_executor.collective_rpc(
-                    "initialize_ple_pool", args=(ple_connector.pool,)
+                    "initialize_ple_reader", args=(ple_connector.reader_config,)
                 )
             except BaseException:
                 ple_connector.close()
                 raise
             self.ple_connector = ple_connector
             scheduler.ple_connector = ple_connector
+            self.model_executor.ple_output_aggregator = PLEOutputAggregator(
+                vllm_config.parallel_config.world_size
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -726,15 +730,6 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
-    def _reclaim_ple_results(self) -> None:
-        connector = self.ple_connector
-        if connector is not None and (result_ids := connector.cleanup_ids()):
-            acknowledgements = self.model_executor.collective_rpc(
-                "acknowledge_ple_results", args=(result_ids,)
-            )
-            assert acknowledgements
-            connector.reclaim(list(set(result_ids).intersection(*acknowledgements)))
-
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -743,7 +738,8 @@ class EngineCore:
         """
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
-        self._reclaim_ple_results()
+        if self.ple_connector is not None:
+            self.ple_connector.poll()
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
@@ -800,7 +796,8 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
-        self._reclaim_ple_results()
+        if self.ple_connector is not None:
+            self.ple_connector.poll()
 
         model_executed = False
         deferred_scheduler_output = None

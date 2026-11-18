@@ -734,7 +734,7 @@ class Qwen4ExpForCausalLM(
         self.config = config
         self.scheduler_config = vllm_config.scheduler_config
         engram = vllm_config.engram_config
-        if engram is not None and engram.prefill_ple_pool_bytes is not None:
+        if engram is not None and engram.prefill_ple_enabled:
             self.is_unused_checkpoint_weight = _is_ple_table_shard
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

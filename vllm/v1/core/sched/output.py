@@ -56,7 +56,6 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
-    ple_result: PLEResult | None = None
 
     @classmethod
     def from_request(
@@ -300,6 +299,9 @@ class SchedulerOutput:
 
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
+
+    ple_results: dict[str, PLEResult] = field(default_factory=dict)
+    ple_retire_ids: set[str] = field(default_factory=set)
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None

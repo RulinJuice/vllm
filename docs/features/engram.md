@@ -133,13 +133,14 @@ Costs and limits:
 
 ## Scheduler-side prefill (Qwen4Exp)
 
-Set `prefill_ple_pool_bytes` on the prefill instance to enable scheduler-side
-PLE with a local DRAM table.
+Set `prefill_ple_provider` to `"local"` on the prefill instance to enable
+scheduler-side PLE with a local DRAM table. The compatibility option
+`prefill_ple_pool_bytes` also enables LocalProvider.
 
 ```bash
 vllm serve <qwen4exp-checkpoint> \
   --distributed-executor-backend mp \
-  --engram-config '{"prefill_ple_pool_bytes": 268435456, "prefill_ple_timeout": 30}'
+  --engram-config '{"prefill_ple_provider": "local", "prefill_ple_provider_options": {"pool_bytes": 268435456}, "prefill_ple_timeout": 30}'
 ```
 
 EngineCore loads one table and prepares rows in a background thread after
@@ -147,6 +148,10 @@ the scheduler establishes the reusable KV prefix. Requests can wait for their
 rows while other requests run. The TP workers map the same result pool and
 copy the current batch's rows to their GPUs. The PLE layer waits for the
 copy when it consumes the rows.
+
+Preparation continues when the current step has no token budget or free
+running slots. Compute admission still requires both. With external KV,
+PLE preparation starts only after the asynchronous load finishes.
 
 This mode requires Linux CUDA, Model Runner V2, one Qwen4Exp PLE table in
 a BF16 or FP8 safetensors checkpoint, and single-node tensor parallelism
@@ -156,12 +161,19 @@ Local prefix caching and asynchronous external KV loads can reduce the
 range prepared for a prompt. A synchronous external KV hit returns a
 request error.
 
-Size the result pool for the prompt suffixes that can wait or run at the
+LocalProvider owns the result pool; Connector does not maintain a byte budget.
+The local pool defaults to 512 MiB. Size it for prompt suffixes that can run at the
 same time. Each prepared token takes `ple_embed_dim` elements in the
 checkpoint dtype. The pool uses `/dev/shm` and is registered for CUDA DMA
 once per worker. A suffix larger than the pool fails immediately. The
 `prefill_ple_timeout` value bounds the wait for rows or pool space in
-seconds and defaults to 30.
+seconds and defaults to 30. `prefill_ple_max_preparations` (default 16) bounds
+the number of retained preparations, including pending, ready and retiring results.
+
+External backends use an importable factory in `prefill_ple_provider` and
+backend-specific `prefill_ple_provider_options`. They own allocation and
+capacity while reusing the common hashing, lifecycle and Reader. See the
+[provider integration guide](../design/ple_provider_integration.md).
 
 See the [scheduler-side PLE design](../design/ple_connector.md) for the
 provider contract and buffer lifecycle.

@@ -503,8 +503,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         engram_config = get_current_vllm_config().engram_config
         embedding_cls = (
             Qwen4ExpPLEStagedEmbedding
-            if engram_config is not None
-            and engram_config.prefill_ple_pool_bytes is not None
+            if engram_config is not None and engram_config.prefill_ple_enabled
             else Qwen4ExpPLEDiskOffloadEmbedding
             if engram_config is not None and engram_config.disk_offload
             else Qwen4ExpPLEPinnedHostEmbedding

@@ -1602,7 +1602,7 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
-        if self.engram_config.prefill_ple_pool_bytes is not None:
+        if self.engram_config.prefill_ple_enabled:
             assert model_config is not None
             if (
                 not self.use_v2_model_runner

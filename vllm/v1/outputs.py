@@ -299,6 +299,8 @@ class ModelRunnerOutput:
 
     ec_connector_output: ECConnectorOutput | None = None
 
+    ple_consumed_result_ids: set[str] = field(default_factory=set)
+
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
@@ -309,6 +311,16 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    @staticmethod
+    def with_ple_consumed(
+        output: "ModelRunnerOutput", consumed: set[str]
+    ) -> "ModelRunnerOutput":
+        if not consumed and not output.ple_consumed_result_ids:
+            return output
+        output = copy(output)
+        output.ple_consumed_result_ids = set(consumed)
+        return output
 
     @staticmethod
     def with_kv_conn_output_only(

@@ -1,35 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
-import mmap
-import os
-import tempfile
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from itertools import count
+from uuid import uuid4
 
 import torch
 
 from vllm.logger import init_logger
 
 from .provider import PLEProvider
-from .types import PLEPool, PLEResult
+from .types import PLEReaderConfig, PLEResult, PreparedRows
 
 logger = init_logger(__name__)
 
 
 @dataclass
-class _Lookup:
-    result: PLEResult
-    future: Future[str | None]
+class _Preparation:
+    result_id: str
+    start: int
+    end: int
+    deadline: float
+    future: Future[PreparedRows] = field(default_factory=Future)
+    completed_at: float = 0
+    provider_started: bool = False
     dispatched: bool = False
+    release: Future[None] | None = None
+    retry_at: float = 0
+    retry_delay: float = 0.1
 
 
 class PLEConnector:
-    """Own PLE result storage and admission state on the EngineCore thread."""
+    """Bind asynchronous row preparation to requests on the EngineCore thread.
+
+    Background callbacks only complete their own preparation, never mutate
+    scheduler state. Providers own storage and all capacity decisions.
+    """
 
     def __init__(
         self,
@@ -39,151 +48,196 @@ class PLEConnector:
         num_heads: int,
         row_bytes: int,
         dtype: torch.dtype,
-        pool_bytes: int,
+        max_preparations: int,
         timeout: float,
-        directory: str = "/dev/shm",
+        num_workers: int = 1,
     ) -> None:
+        if min(num_heads, row_bytes, max_preparations, timeout) <= 0:
+            raise ValueError("PLE dimensions and preparation limits must be positive")
         self._provider = provider
         self._row_ids = row_ids
-        self._row_bytes = row_bytes
+        self._num_heads = num_heads
         self._timeout = timeout
-        # Keep the file named until shutdown so ranks can map it at startup.
-        self._file = tempfile.NamedTemporaryFile(  # noqa: SIM115
-            prefix="vllm-ple-", dir=directory
+        self._max_preparations = max_preparations
+        self.reader_config = PLEReaderConfig(
+            provider.export_pool(num_workers), num_heads * row_bytes, str(dtype)
         )
-        try:
-            if hasattr(os, "posix_fallocate"):
-                os.posix_fallocate(self._file.fileno(), 0, pool_bytes)
-            else:
-                self._file.truncate(pool_bytes)
-            self._memory = mmap.mmap(self._file.fileno(), pool_bytes)
-        except BaseException:
-            self._file.close()
-            raise
-        self.pool = PLEPool(
-            self._file.name, pool_bytes, num_heads * row_bytes, str(dtype)
-        )
-        self._available = [(0, pool_bytes)]
-        self._result_ids = count()
-        self._lookups: dict[str, _Lookup] = {}
-        self._retiring: dict[int, _Lookup] = {}
+        self._session = uuid4().hex
+        self._ids = count()
+        self._requests: dict[str, _Preparation] = {}
+        self._retiring: dict[str, _Preparation] = {}
         self._deadlines: dict[str, float] = {}
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ple-hash"
+        )
+        self._closed = False
 
-    def _gather(self, tokens: Sequence[int], result: PLEResult) -> str | None:
+    def _complete(
+        self,
+        preparation: _Preparation,
+        result: PreparedRows | None = None,
+        error: str | None = None,
+    ) -> None:
+        preparation.completed_at = time.monotonic()
+        if error is not None:
+            preparation.future.set_exception(RuntimeError(error))
+        else:
+            assert result is not None
+            preparation.future.set_result(result)
+
+    def _prepare(self, preparation: _Preparation, tokens: Sequence[int]) -> None:
+        error = None
         try:
-            size = (result.end - result.start) * self.pool.token_bytes
-            out = torch.frombuffer(
-                self._memory, dtype=torch.uint8, count=size, offset=result.offset
-            ).view(-1, self._row_bytes)
-            self._provider.lookup_into(self._row_ids(tokens, result.start), out)
+            ids = self._row_ids(tokens, preparation.start)
+            if (
+                ids.device.type != "cpu"
+                or ids.dtype != torch.int64
+                or ids.ndim != 1
+                or not ids.is_contiguous()
+                or ids.numel()
+                != (preparation.end - preparation.start) * self._num_heads
+            ):
+                raise ValueError("Model PLE hashing returned invalid row IDs")
+            preparation.provider_started = True
+            future = self._provider.prepare(preparation.result_id, ids)
+            # Continue immediately after hashing; never wait for provider I/O
+            # on the hashing thread.
+            future.add_done_callback(lambda done: self._prepared(preparation, done))
         except Exception as exc:
-            # Keep only the message, since a traceback can retain the mmap view.
-            return str(exc) or type(exc).__name__
-        return None
+            error = str(exc) or type(exc).__name__
+        if error is not None:
+            self._complete(preparation, error=error)
 
-    def _allocate(self, size: int) -> int | None:
-        for index, (start, end) in enumerate(self._available):
-            if end - start >= size:
-                if end - start == size:
-                    self._available.pop(index)
-                else:
-                    self._available[index] = (start + size, end)
-                return start
-        return None
-
-    def _free(self, result: PLEResult) -> None:
-        end = result.offset + (result.end - result.start) * self.pool.token_bytes
-        free_ranges = sorted([*self._available, (result.offset, end)])
-        self._available = []
-        for start, end in free_ranges:
-            if self._available and self._available[-1][1] == start:
-                self._available[-1] = (self._available[-1][0], end)
-            else:
-                self._available.append((start, end))
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "PLE release result=%d pool_used_bytes=%d",
-                result.result_id,
-                self.pool.size - sum(end - start for start, end in self._available),
-            )
+    def _prepared(
+        self, preparation: _Preparation, future: Future[PreparedRows]
+    ) -> None:
+        error = None
+        result = None
+        try:
+            result = future.result()
+            pool = self.reader_config.pool
+            if (
+                result.result_id != preparation.result_id
+                or result.pool_id != pool.pool_id
+                or not result.chunks
+                or any(
+                    c.offset < 0 or c.nbytes <= 0 or c.offset + c.nbytes > pool.size
+                    for c in result.chunks
+                )
+                or sum(c.nbytes for c in result.chunks)
+                != (preparation.end - preparation.start)
+                * self.reader_config.token_bytes
+            ):
+                raise ValueError("Provider returned an invalid PLE result descriptor")
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+        self._complete(preparation, result, error)
 
     def ensure_ready(self, req_id: str, tokens: Sequence[int], start: int) -> bool:
-        if not 0 <= start < len(tokens):
-            raise ValueError("PLE requires a nonempty prompt suffix")
-        deadline = self._deadlines.setdefault(req_id, time.monotonic() + self._timeout)
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for PLE rows")
-        lookup = self._lookups.get(req_id)
-        if lookup is not None:
-            if lookup.result.start <= start and lookup.result.end == len(tokens):
-                if not lookup.future.done():
-                    return False
-                if error := lookup.future.result():
-                    raise RuntimeError(error)
-                return True
-            # Recompute the suffix when the valid KV prefix moves backwards.
-            self._retire(self._lookups.pop(req_id))
-        size = (len(tokens) - start) * self.pool.token_bytes
-        if size > self.pool.size:
-            raise ValueError("PLE prompt suffix exceeds the shared result pool")
-        if (offset := self._allocate(size)) is None:
-            return False
-        result = PLEResult(next(self._result_ids), start, len(tokens), offset)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "PLE lookup request=%s result=%d range=[%d,%d) bytes=%d "
-                "pool_used_bytes=%d",
-                req_id,
-                result.result_id,
-                result.start,
-                result.end,
-                size,
-                self.pool.size - sum(end - start for start, end in self._available),
+        if self._closed or not 0 <= start < len(tokens):
+            raise ValueError(
+                "PLE requires an open connector and nonempty prompt suffix"
             )
-        self._lookups[req_id] = _Lookup(
-            result, self._executor.submit(self._gather, tokens, result)
-        )
-        return False
+        self.poll()
+        deadline = self._deadlines.setdefault(req_id, time.monotonic() + self._timeout)
+        preparation = self._requests.get(req_id)
+        if preparation is not None and not (
+            preparation.start <= start and preparation.end == len(tokens)
+        ):
+            self._retiring[preparation.result_id] = self._requests.pop(req_id)
+            preparation = None
+        if preparation is None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for PLE preparation admission")
+            if len(self._requests) + len(self._retiring) >= self._max_preparations:
+                return False
+            preparation = _Preparation(
+                f"{self._session}-{next(self._ids)}", start, len(tokens), deadline
+            )
+            self._requests[req_id] = preparation
+            self._executor.submit(self._prepare, preparation, tuple(tokens))
+        if (preparation.completed_at or time.monotonic()) >= preparation.deadline:
+            raise TimeoutError("Timed out waiting for PLE rows")
+        if not preparation.future.done():
+            return False
+        preparation.future.result()
+        return True
 
     def dispatch(self, req_id: str) -> PLEResult:
-        lookup = self._lookups[req_id]
-        lookup.dispatched = True
+        preparation = self._requests[req_id]
+        rows = preparation.future.result()
+        preparation.dispatched = True
         self._deadlines.pop(req_id, None)
-        logger.debug(
-            "PLE dispatch request=%s result=%d", req_id, lookup.result.result_id
-        )
-        return lookup.result
-
-    def _retire(self, lookup: _Lookup) -> None:
-        if not lookup.dispatched and (lookup.future.cancel() or lookup.future.done()):
-            self._free(lookup.result)
-        else:
-            self._retiring[lookup.result.result_id] = lookup
+        return PLEResult(preparation.start, preparation.end, rows)
 
     def finish(self, req_id: str) -> None:
         self._deadlines.pop(req_id, None)
-        if (lookup := self._lookups.pop(req_id, None)) is not None:
-            self._retire(lookup)
+        if (preparation := self._requests.pop(req_id, None)) is not None:
+            self._retiring[preparation.result_id] = preparation
+        self.poll()
 
-    def cleanup_ids(self) -> list[int]:
-        dispatched = []
-        for result_id, lookup in list(self._retiring.items()):
-            if lookup.dispatched:
-                dispatched.append(result_id)
-            elif lookup.future.done():
-                self.reclaim([result_id])
-        return dispatched
+    def retire_ids(self) -> set[str]:
+        self.poll()
+        return {key for key, value in self._retiring.items() if value.dispatched}
+
+    def update_from_output(self, consumed: set[str]) -> None:
+        for result_id in consumed:
+            if (preparation := self._retiring.get(result_id)) is not None:
+                preparation.dispatched = False
+        self.poll()
+
+    def poll(self) -> None:
+        for key, preparation in list(self._retiring.items()):
+            if preparation.dispatched or not preparation.future.done():
+                continue
+            if not preparation.provider_started:
+                del self._retiring[key]
+                continue
+            if preparation.release is None:
+                if time.monotonic() < preparation.retry_at:
+                    continue
+                try:
+                    preparation.release = self._provider.release(key)
+                except Exception as exc:
+                    self._retry_release(preparation, exc)
+                    continue
+            if not preparation.release.done():
+                continue
+            try:
+                preparation.release.result()
+            except Exception as exc:
+                self._retry_release(preparation, exc)
+            else:
+                del self._retiring[key]
+
+    def _retry_release(self, preparation: _Preparation, error: Exception) -> None:
+        logger.warning(
+            "PLE release %s failed; will retry: %s", preparation.result_id, error
+        )
+        preparation.release = None
+        preparation.retry_at = time.monotonic() + preparation.retry_delay
+        preparation.retry_delay = min(5.0, preparation.retry_delay * 2)
 
     @property
     def has_cleanup(self) -> bool:
         return bool(self._retiring)
 
-    def reclaim(self, result_ids: Sequence[int]) -> None:
-        for result_id in result_ids:
-            self._free(self._retiring.pop(result_id).result)
-
-    def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        self._memory.close()
-        self._file.close()
+    def close(self, *, consumers_stopped: bool = False) -> None:
+        preparations = [*self._requests.values(), *self._retiring.values()]
+        if not consumers_stopped and any(p.dispatched for p in preparations):
+            raise RuntimeError("Stop PLE consumers before closing dispatched results")
+        self._closed = True
+        for req_id in list(self._requests):
+            self.finish(req_id)
+        if consumers_stopped:
+            for preparation in self._retiring.values():
+                preparation.dispatched = False
+        while self._retiring:
+            self.poll()
+            pending = [p.future for p in self._retiring.values() if not p.future.done()]
+            if pending:
+                wait(pending, timeout=0.001)
+            elif self._retiring:
+                time.sleep(0.001)
+        self._executor.shutdown(wait=True)
+        self._provider.close()

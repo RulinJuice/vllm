@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from pydantic import Field, model_validator
 
@@ -42,8 +42,18 @@ class EngramConfig:
     rows on the host instead of allocating the table. Takes precedence over
     cpu_offload."""
 
+    prefill_ple_provider: str | None = None
+    """Scheduler-side PLE backend: 'local' or an importable provider factory."""
+
+    prefill_ple_provider_options: dict[str, Any] = Field(default_factory=dict)
+    """Provider-specific constructor options; never interpreted by Connector."""
+
     prefill_ple_pool_bytes: int | None = Field(default=None, gt=0)
-    """Enable scheduler-side PLE with this shared result capacity in bytes."""
+    """LocalProvider pool capacity; also enables the local backend for compatibility.
+    With an explicit local backend, defaults to 512 MiB. Not a Connector budget."""
+
+    prefill_ple_max_preparations: int = Field(default=16, gt=0)
+    """Maximum retained preparations, including ready and retiring results."""
 
     prefill_ple_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     """Seconds a request can wait for scheduler-side PLE rows."""
@@ -67,9 +77,21 @@ class EngramConfig:
     startup takes longer. Requires cpu_offload without dp_shared_memory.
     Always on for private tables on ROCm."""
 
+    @property
+    def prefill_ple_enabled(self) -> bool:
+        return (
+            self.prefill_ple_provider is not None
+            or self.prefill_ple_pool_bytes is not None
+        )
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
-        if self.prefill_ple_pool_bytes is not None and (
+        if (
+            self.prefill_ple_provider not in (None, "local")
+            and self.prefill_ple_pool_bytes is not None
+        ):
+            raise ValueError("prefill_ple_pool_bytes only configures LocalProvider")
+        if self.prefill_ple_enabled and (
             self.disk_offload
             or self.embedding_across_dp
             or self.dp_shared_memory
@@ -105,7 +127,7 @@ class EngramConfig:
 
             if field != "ple_layer_ids" or not current_platform.is_cuda():
                 raise ValueError("disk_offload requires a Qwen4Exp model on CUDA")
-        if self.prefill_ple_pool_bytes is not None:
+        if self.prefill_ple_enabled:
             from vllm.platforms import current_platform
 
             if (
@@ -129,7 +151,7 @@ class EngramConfig:
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
-        if self.prefill_ple_pool_bytes is not None and (
+        if self.prefill_ple_enabled and (
             parallel_config.nnodes != 1
             or parallel_config.data_parallel_size != 1
             or parallel_config.pipeline_parallel_size != 1

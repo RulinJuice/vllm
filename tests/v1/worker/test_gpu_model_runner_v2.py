@@ -89,6 +89,7 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback(monkeypatch):
     runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
     runner.eplb = SimpleNamespace(step=Mock())
     runner.execute_model_state = ExecuteModelState(
+        ple_consumed_result_ids=set(),
         input_batch=local_batch,
         attn_metadata=None,
         slot_mappings_by_layer=None,

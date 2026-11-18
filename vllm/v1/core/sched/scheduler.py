@@ -1087,7 +1087,8 @@ class Scheduler(SchedulerInterface):
                 loads_only = (
                     num_running >= self.max_num_active_reqs or token_budget <= 0
                 )
-                if not loads_only:
+                # PLE preparation can proceed without compute admission capacity.
+                if not loads_only or self.ple_connector is not None:
                     # Requests holding KV blocks are always drained first, and are
                     # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
                     request_queue = self.kv_holding_waiting
@@ -1100,7 +1101,9 @@ class Scheduler(SchedulerInterface):
                 else:
                     break
                 if not request_queue or (
-                    not loads_only and input_budget <= draft_slots
+                    not loads_only
+                    and input_budget <= draft_slots
+                    and self.ple_connector is None
                 ):
                     break
 
@@ -1315,7 +1318,7 @@ class Scheduler(SchedulerInterface):
                 num_replay_tokens = 0
 
                 if (load_kv_async and not self._admits_inflight_kv_load()) or (
-                    loads_only and not load_kv_async
+                    loads_only and not load_kv_async and self.ple_connector is None
                 ):
                     # Past --max-num-inflight-kv-loads, or needs a running slot
                     # while none is free. It waits at the head of its queue;
@@ -1329,7 +1332,11 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                elif (
+                    defer_prefills
+                    and num_computed_tokens < request.num_tokens - 1
+                    and self.ple_connector is None
+                ):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
@@ -1369,6 +1376,17 @@ class Scheduler(SchedulerInterface):
                             )
                             ple_ready = False
                         if not ple_ready:
+                            skip_request(request_queue)
+                            continue
+                        if (
+                            loads_only
+                            or input_budget <= draft_slots
+                            or (
+                                defer_prefills
+                                and num_computed_tokens < request.num_tokens - 1
+                            )
+                        ):
+                            # Preparing rows needs neither tokens nor a worker slot.
                             skip_request(request_queue)
                             continue
                     # Number of tokens to be scheduled.
@@ -1727,9 +1745,6 @@ class Scheduler(SchedulerInterface):
                 )
                 for req in scheduled_new_reqs
             ]
-            if self.ple_connector is not None:
-                for data in new_reqs_data:
-                    data.ple_result = self.ple_connector.dispatch(data.req_id)
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
@@ -1802,6 +1817,15 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            ple_results={
+                req_id: self.ple_connector.dispatch(req_id)
+                for req_id in num_scheduled_tokens
+            }
+            if self.ple_connector is not None
+            else {},
+            ple_retire_ids=self.ple_connector.retire_ids()
+            if self.ple_connector is not None
+            else set(),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2640,6 +2664,9 @@ class Scheduler(SchedulerInterface):
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
         if self.ple_connector is not None:
+            self.ple_connector.update_from_output(
+                model_runner_output.ple_consumed_result_ids
+            )
             request_errors.update(self.ple_request_errors)
             self.ple_request_errors.clear()
         error_req_ids = set(request_errors)
@@ -3452,7 +3479,7 @@ class Scheduler(SchedulerInterface):
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
         if self.ple_connector is not None:
-            self.ple_connector.close()
+            self.ple_connector.close(consumers_stopped=True)
             self.ple_connector = None
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()

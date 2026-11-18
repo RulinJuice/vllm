@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.ple.output import PLEOutputAggregator
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -130,6 +131,7 @@ class MultiprocExecutor(Executor):
         super().__init__(vllm_config)
 
     def _init_executor(self) -> None:
+        self._shutdown_lock = threading.RLock()
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
@@ -414,6 +416,7 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
             ec_output_aggregator=self.ec_output_aggregator,
+            ple_output_aggregator=self.ple_output_aggregator,
         )
 
     def sample_tokens(  # type: ignore[override]
@@ -427,6 +430,7 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
             ec_output_aggregator=self.ec_output_aggregator,
+            ple_output_aggregator=self.ple_output_aggregator,
         )
 
     def execute_dummy_batch(self) -> None:
@@ -454,6 +458,7 @@ class MultiprocExecutor(Executor):
         unique_reply_rank: int | None = None,
         kv_output_aggregator: KVOutputAggregator | None = None,
         ec_output_aggregator: ECOutputAggregator | None = None,
+        ple_output_aggregator: PLEOutputAggregator | None = None,
     ) -> Any:
         """Returns single result if unique_reply_rank and/or an output
         aggregator is provided, otherwise list."""
@@ -466,7 +471,11 @@ class MultiprocExecutor(Executor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        aggregators = [a for a in (kv_output_aggregator, ec_output_aggregator) if a]
+        aggregators = [
+            a
+            for a in (kv_output_aggregator, ec_output_aggregator, ple_output_aggregator)
+            if a
+        ]
         aggregate: Callable[[Any], Any]
         if aggregators:
             output_rank = None
@@ -478,6 +487,7 @@ class MultiprocExecutor(Executor):
                 result = outputs[rank]
                 for a in aggregators:
                     result = a.aggregate(outputs, output_rank=rank)
+                    outputs[rank] = result
                 return result
 
             aggregate = _aggregate
@@ -606,41 +616,46 @@ class MultiprocExecutor(Executor):
             )
             for p in remaining:
                 p.kill()
+            if not wait_for_termination(active_procs(), 4):
+                raise RuntimeError("Workers remain alive after SIGKILL")
 
     def shutdown(self):
         """Properly shut down the executor and its workers."""
-        if not getattr(self, "shutting_down", False):
-            worker_count = len(getattr(self, "workers", None) or [])
-            logger.debug(
-                "[shutdown] Executor: start worker_count=%d",
-                worker_count,
-            )
-            self.shutting_down = True
+        with self._shutdown_lock:
+            if not getattr(self, "shutting_down", False):
+                worker_count = len(getattr(self, "workers", None) or [])
+                logger.debug(
+                    "[shutdown] Executor: start worker_count=%d",
+                    worker_count,
+                )
+                self.shutting_down = True
 
-            # Make sure all the worker processes are terminated first.
-            if workers := getattr(self, "workers", None):
-                for w in workers:
-                    # Close death_writer to signal child processes to exit
-                    if w.death_writer is not None:
-                        w.death_writer.close()
-                        w.death_writer = None
-                self._ensure_worker_termination([w.proc for w in workers])
+                # Make sure all the worker processes are terminated first.
+                if workers := getattr(self, "workers", None):
+                    for w in workers:
+                        # Close death_writer to signal child processes to exit
+                        if w.death_writer is not None:
+                            w.death_writer.close()
+                            w.death_writer = None
+                    self._ensure_worker_termination([w.proc for w in workers])
 
-                for w in workers:
-                    # Shutdown response queues
-                    if w.worker_response_mq is not None:
-                        w.worker_response_mq.shutdown()
-                        w.worker_response_mq = None
+                    for w in workers:
+                        # Shutdown response queues
+                        if w.worker_response_mq is not None:
+                            w.worker_response_mq.shutdown()
+                            w.worker_response_mq = None
 
-        if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
-            rpc_broadcast_mq.shutdown()
-            self.rpc_broadcast_mq = None
-        if response_mqs := getattr(self, "response_mqs", None):
-            for mq in response_mqs:
-                mq.shutdown()
-            self.response_mqs = []
+            if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
+                rpc_broadcast_mq.shutdown()
+                self.rpc_broadcast_mq = None
+            if response_mqs := getattr(self, "response_mqs", None):
+                for mq in response_mqs:
+                    mq.shutdown()
+                self.response_mqs = []
 
-        logger.debug_once("[shutdown] Executor: complete")
+            if any(w.proc.is_alive() for w in (getattr(self, "workers", None) or [])):
+                raise RuntimeError("Cannot close executor while workers remain alive")
+            logger.debug_once("[shutdown] Executor: complete")
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)

@@ -108,7 +108,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.ple.types import PLEPool
+from vllm.v1.ple.types import PLEReaderConfig
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.extensible_kv_cache import (
     extend_kv_cache,
@@ -686,15 +686,11 @@ class Worker(WorkerBase):
             setattr(self.model_runner, config_name, new_config)
             setattr(self, config_name, new_config)
 
-    def initialize_ple_pool(self, pool: PLEPool) -> None:
+    def initialize_ple_reader(self, config: PLEReaderConfig) -> None:
         assert self.use_v2_model_runner
-        cast("GPUModelRunnerV2", self.model_runner).initialize_ple_pool(pool)
-
-    def acknowledge_ple_results(self, result_ids: list[int]) -> list[int]:
-        assert self.use_v2_model_runner
-        reader = cast("GPUModelRunnerV2", self.model_runner).ple_reader
-        assert reader is not None
-        return reader.acknowledge(result_ids)
+        cast("GPUModelRunnerV2", self.model_runner).initialize_ple_reader(
+            config, self.rank
+        )
 
     def reload_weights(
         self,
@@ -703,7 +699,7 @@ class Worker(WorkerBase):
         is_checkpoint_format: bool = True,
     ) -> None:
         engram = self.vllm_config.engram_config
-        if engram is not None and engram.prefill_ple_pool_bytes is not None:
+        if engram is not None and engram.prefill_ple_enabled:
             raise ValueError("Scheduler-side PLE requires immutable weights")
         # Kernel-format weights are copied into place, needing no room.
         kv_cache_loan = (

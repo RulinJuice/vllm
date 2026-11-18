@@ -87,7 +87,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.ple.reader import PLEReader
-from vllm.v1.ple.types import PLEPool
+from vllm.v1.ple.types import PLEReaderConfig
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -1228,7 +1228,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
-    def initialize_ple_pool(self, pool: PLEPool) -> None:
+    def initialize_ple_reader(self, config: PLEReaderConfig, rank: int) -> None:
         from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
             Qwen4ExpPLEStagedEmbedding,
         )
@@ -1238,14 +1238,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for module in self.model.modules()
             if isinstance(module, Qwen4ExpPLEStagedEmbedding)
         ]
-        self.ple_reader = PLEReader(pool, embedding.rows, embedding.rows_ready)
+        self.ple_reader = PLEReader(
+            config, embedding.rows, embedding.rows_ready, rank=rank
+        )
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
-        if self.ple_reader is not None:
-            self.ple_reader.remove_request(req_id)
         self.draft_tokens_handler.discard(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
@@ -1328,9 +1328,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
-            if self.ple_reader is not None:
-                assert new_req_data.ple_result is not None
-                self.ple_reader.attach(req_id, new_req_data.ple_result)
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
@@ -1847,6 +1844,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        ple_consumed = (
+            self.ple_reader.release(scheduler_output.ple_retire_ids)
+            if self.ple_reader is not None and not dummy_run
+            else set()
+        )
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
@@ -1868,8 +1870,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return self._merge_ec_connector_no_forward(
-                    scheduler_output, empty_output
+                return ModelRunnerOutput.with_ple_consumed(
+                    self._merge_ec_connector_no_forward(scheduler_output, empty_output),
+                    ple_consumed,
                 )
 
         # Get batch descriptor and sync across DP ranks.
@@ -1925,7 +1928,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
-            return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+            return ModelRunnerOutput.with_ple_consumed(
+                self._merge_ec_connector_no_forward(scheduler_output, empty_output),
+                ple_consumed,
+            )
 
         cudagraph_stats = None
         if not dummy_run:
@@ -1938,7 +1944,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             if self.ple_reader is not None:
-                self.ple_reader.stage(input_batch)
+                self.ple_reader.stage(input_batch, scheduler_output.ple_results)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -2206,6 +2212,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else scheduler_output.skip_drafts
         )
         self.execute_model_state = ExecuteModelState(
+            ple_consumed_result_ids=ple_consumed,
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
@@ -2248,6 +2255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        ple_consumed = self.execute_model_state.ple_consumed_result_ids
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2315,6 +2323,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
+            ple_consumed_result_ids=ple_consumed,
             req_ids=input_batch.req_ids,
             # NOTE(woosuk): req_id_to_index is unused in this model runner.
             # Only for compatibility with the existing model runner and scheduler.
@@ -2568,6 +2577,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
 
 class ExecuteModelState(NamedTuple):
+    ple_consumed_result_ids: set[str]
     input_batch: InputBatch
     attn_metadata: dict[str, Any] | None
     slot_mappings_by_layer: dict[str, torch.Tensor] | None
