@@ -25,6 +25,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
+from vllm.v1.metrics.ple import PLE_GAUGES
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     KV_FETCH_STAGES,
@@ -589,6 +590,24 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.gauge_kv_fetch_by_stage[stage] = create_metric_per_engine(
                     gauge_kv_fetch_by_stage, per_engine_labelvalues_with_stage
                 )
+
+        self.ple_gauges = {}
+        if (
+            vllm_config.engram_config is not None
+            and vllm_config.engram_config.prefill_ple_enabled
+        ):
+            self.ple_gauges = {
+                name: create_metric_per_engine(
+                    self._gauge_cls(
+                        name=f"vllm:{name}",
+                        documentation=description,
+                        labelnames=labelnames,
+                        multiprocess_mode="mostrecent",
+                    ),
+                    per_engine_labelvalues,
+                )
+                for name, description in PLE_GAUGES.items()
+            }
 
         gauge_engine_sleep_state = self._gauge_cls(
             name="vllm:engine_sleep_state",
@@ -1162,6 +1181,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 gauges[engine_idx].set(
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
+            for name, gauges in self.ple_gauges.items():
+                gauges[engine_idx].set(scheduler_stats.ple_metrics.get(name, 0.0))
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
 
             self.counter_prefix_cache_queries[engine_idx].inc(

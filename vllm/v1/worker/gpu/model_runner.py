@@ -1233,6 +1233,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             Qwen4ExpPLEStagedEmbedding,
         )
 
+        if self.ple_reader is not None:
+            raise RuntimeError("PLE reader is already initialized")
         (embedding,) = [
             module
             for module in self.model.modules()

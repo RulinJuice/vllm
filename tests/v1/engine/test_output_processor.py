@@ -1897,6 +1897,39 @@ def test_request_rejected_by_engine(runner: str, error, exception_type):
         queue.get_nowait()
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("retryable", [False, True])
+def test_generation_reports_structured_zero_token_error(retryable):
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="internal",
+        external_req_id="external",
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(logprobs=1),
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        pooling_params=None,
+    )
+    processor.add_request(request, prompt=None)
+    error = RequestError(
+        code="ple_lookup_failed", message="read failed", retryable=retryable
+    )
+    (result,) = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request.request_id, [], finish_reason=FinishReason.ERROR, error=error
+            )
+        ]
+    ).request_outputs
+    assert isinstance(result, RequestOutput)
+    assert result.error == error and result.finished
+    assert result.outputs[0].finish_reason == "error"
+    assert not result.outputs[0].token_ids and not result.outputs[0].logprobs
+
+
 @pytest.mark.parametrize("output_kind", list(RequestOutputKind))
 def test_sampling_masks_follow_output_kind(output_kind):
     state = RequestState.__new__(RequestState)

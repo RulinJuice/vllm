@@ -6,6 +6,8 @@ from typing import Protocol
 
 import torch
 
+from vllm.v1.metrics.ple import PLEFetchObservation
+
 from .types import PoolDescriptor, PreparedRows
 
 
@@ -34,12 +36,25 @@ class PLEProvider(Protocol):
     def release(self, result_id: str) -> Future[None]:
         """Idempotently finish production and release provider-owned resources.
 
-        Unknown IDs succeed. Failure retains a retryable cleanup entry. This
-        also handles cancellation followed by late success. SDK-internal
-        cleanup after failed production need not finish before this succeeds.
+        May be called as soon as prepare() returns, while its Future is still
+        pending. Withdraw queued work or dispose of a late result before this
+        Future succeeds. Unknown IDs succeed. A failed release remains retryable.
+        SDK-internal cleanup after failed production may continue independently.
         """
         ...
 
     def close(self) -> None:
         """Close the pool after production and all worker use have ended."""
         ...
+
+
+class ObservedPLEProvider(PLEProvider, Protocol):
+    """Optional transport instrumentation for providers with a fetch boundary."""
+
+    def prepare(
+        self,
+        result_id: str,
+        row_ids: torch.Tensor,
+        *,
+        observation: PLEFetchObservation | None = None,
+    ) -> Future[PreparedRows]: ...

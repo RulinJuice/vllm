@@ -28,6 +28,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.ple.connector import PLEConnector
 
 logger = init_logger(__name__)
 
@@ -373,6 +374,20 @@ class Executor(ABC):
     def shutdown(self) -> None:
         """Shutdown the executor."""
         self.collective_rpc("shutdown")
+
+    def initialize_ple_readers(self, connector: "PLEConnector") -> None:
+        try:
+            self.collective_rpc(
+                "initialize_ple_reader", args=(connector.reader_config,)
+            )
+        except BaseException:
+            # Other ranks may have already mapped and registered the pool.
+            self.shutdown()
+            connector.close(consumers_stopped=True)
+            raise
+        self.ple_output_aggregator = PLEOutputAggregator(
+            self.parallel_config.world_size
+        )
 
     def init_kv_output_aggregator(self, connector: "KVConnectorBase") -> None:
         """Init KVOutputAggregator."""

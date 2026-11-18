@@ -143,29 +143,30 @@ vllm serve <qwen4exp-checkpoint> \
   --engram-config '{"prefill_ple_provider": "local", "prefill_ple_provider_options": {"pool_bytes": 268435456}, "prefill_ple_timeout": 30}'
 ```
 
-EngineCore loads one table and prepares rows in a background thread after
-the scheduler establishes the reusable KV prefix. Requests can wait for their
-rows while other requests run. The TP workers map the same result pool and
-copy the current batch's rows to their GPUs. The PLE layer waits for the
+Each EngineCore loads one local table. Its workers map the shared result pool
+and copy the current batch's rows to their GPUs. The PLE layer waits for the
 copy when it consumes the rows.
 
-Preparation continues when the current step has no token budget or free
-running slots. Compute admission still requires both. With external KV,
-PLE preparation starts only after the asynchronous load finishes.
+A native asynchronous KV hit starts PLE lookup for the expected prompt suffix
+before KV block allocation. Local hits can also start preparation while token
+budget or running slots are exhausted. Compute waits for both the usable KV
+and the PLE rows. If fewer KV tokens arrive than predicted, the scheduler
+prepares the larger suffix with a fresh timeout. A full hit prepares the one
+token needed for replay. Synchronous external KV hits return a request error.
 
-This mode requires Linux CUDA, Model Runner V2, one Qwen4Exp PLE table in
-a BF16 or FP8 safetensors checkpoint, and single-node tensor parallelism
-with `mp` or `uni`. Submit text prompts with `max_tokens=1` and disable
-speculative decoding. Use the regular PLE backend on the decode instance.
-Local prefix caching and asynchronous external KV loads can reduce the
-range prepared for a prompt. A synchronous external KV hit returns a
-request error.
+This mode requires Linux CUDA, ModelRunner V2, one BF16 or global FP8
+Qwen4Exp PLE table, and single-node `mp` or `uni` workers with PP=1. Each DP
+engine owns its provider and table. TP and context-parallel workers use the
+token segments supplied by the model runner, subject to its supported
+topologies. Submit text prompts with `max_tokens=1`. Qwen4 MTP is supported on
+a KV producer. The decode instance uses its configured decode backend.
 
 LocalProvider owns the result pool; Connector does not maintain a byte budget.
 The local pool defaults to 512 MiB. Size it for prompt suffixes that can run at the
 same time. Each prepared token takes `ple_embed_dim` elements in the
 checkpoint dtype. The pool uses `/dev/shm` and is registered for CUDA DMA
-once per worker. A suffix larger than the pool fails immediately. The
+once per worker. A custom pool directory must support CUDA host registration.
+A suffix larger than the pool fails immediately. The
 `prefill_ple_timeout` value bounds the wait for rows or pool space in
 seconds and defaults to 30. `prefill_ple_max_preparations` (default 16) bounds
 the number of retained preparations, including pending, ready and retiring results.
@@ -173,7 +174,8 @@ the number of retained preparations, including pending, ready and retiring resul
 External backends use an importable factory in `prefill_ple_provider` and
 backend-specific `prefill_ple_provider_options`. They own allocation and
 capacity while reusing the common hashing, lifecycle and Reader. See the
-[provider integration guide](../design/ple_provider_integration.md).
+[provider integration guide](../design/ple_provider_integration.md) and the
+[per-engine transport metrics](../usage/metrics.md#ple-transport).
 
 See the [scheduler-side PLE design](../design/ple_connector.md) for the
 provider contract and buffer lifecycle.

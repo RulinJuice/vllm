@@ -1604,10 +1604,21 @@ class VllmConfig:
         self.engram_config.verify_parallel_config(self.parallel_config)
         if self.engram_config.prefill_ple_enabled:
             assert model_config is not None
+            kv_transfer = self.kv_transfer_config
+            if kv_transfer is not None and not kv_transfer.is_kv_producer:
+                raise ValueError("Scheduler-side PLE supports only prefill producers")
+            prefill_mtp = (
+                speculative_config is not None
+                and speculative_config.method == "mtp"
+                and speculative_config.draft_model_config is not None
+                and speculative_config.draft_model_config.architecture == "Qwen4ExpMTP"
+                and kv_transfer is not None
+                and kv_transfer.is_kv_producer
+            )
             if (
                 not self.use_v2_model_runner
                 or self.is_mm_encoder_only
-                or speculative_config is not None
+                or (speculative_config is not None and not prefill_mtp)
                 or self.parallel_config.use_ubatching
                 or self.weight_transfer_config is not None
                 or self.cache_config.kv_sharing_fast_prefill
@@ -1615,7 +1626,8 @@ class VllmConfig:
             ):
                 raise ValueError(
                     "Scheduler-side PLE requires MRV2 generation without "
-                    "speculation, microbatching, fast prefill, or live weight updates"
+                    "microbatching, fast prefill, or live weight updates. "
+                    "Only Qwen4 MTP on a prefill producer is supported."
                 )
             if self.load_config.load_format not in ("auto", "hf", "safetensors"):
                 raise ValueError("Scheduler-side PLE requires a safetensors checkpoint")

@@ -108,16 +108,37 @@ has been obtained, retain a cleanup entry even if subsequent operations fail.
 
 `release(result_id)` is idempotent, including unknown/already-released IDs.
 It resolves after the production operation and provider-owned cleanup finish.
-If called while producing, it must handle a late successful result. Never
+Cancellation or deadline expiry can trigger release as soon as `prepare()`
+returns, while its Future is still pending. Withdraw queued work when possible,
+and release any result acquired by work already in flight. Never
 implement cancellation by cancelling a Future and forgetting the actual SDK
-operation. A release exception must preserve enough ownership state to retry.
+operation. A preparation `TimeoutError` reaches the client as a retryable request
+error. A provider cancellation fails only the affected request. A release exception must preserve enough ownership state to retry.
 For SDK-managed internal cleanup after a failed operation, release need not wait
 for physical memory reclamation. Do not add byte accounting or cleanup callbacks
 to Connector.
 
 `close()` runs after workers stop and result releases finish. Close SDK clients
 and pool exports there. Worker failure requires terminating consumers before
-releasing their results, rather than treating a missing rank as an acknowledgment.
+releasing their results. If draining exceeds the worker shutdown timeout, the
+Connector reports unresolved result IDs and retains resources for another
+close attempt. Each DP engine exports its pool to its own executor ranks.
+
+## Transport metrics
+
+An adapter can declare a keyword-only `observation: PLEFetchObservation | None = None`
+on `prepare(result_id, row_ids)`. The Connector recognizes this at startup.
+Existing two-argument adapters remain usable. Only instrumented adapters
+publish transport samples.
+
+The Connector starts the total timer when it admits a preparation, before
+background hashing. Wrap each SDK stage in `with observation.measure("prepare")`
+or `with observation.measure("fetch")`. After fetching and validating the byte
+count, call `observation.finish()` **before** acquiring READ references.
+On a transport exception, call `observation.finish(exc)` and propagate the
+exception. Completion is idempotent. Once transport succeeds, a later READ
+failure still fails the request and follows normal cleanup. The seven Prometheus
+gauges and their window are described in the [metrics guide](../usage/metrics.md#ple-transport).
 
 ## Adapter migration checklist
 

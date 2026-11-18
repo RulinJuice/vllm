@@ -2153,6 +2153,21 @@ def test_engram_explicit_config_requires_supported_model():
         VllmConfig(engram_config=EngramConfig(cpu_offload=False))
 
 
+def test_scheduler_ple_owns_each_engines_pool_in_parallel_prefill():
+    parallel = ParallelConfig(
+        tensor_parallel_size=2,
+        data_parallel_size=2,
+        prefill_context_parallel_size=2,
+        enable_expert_parallel=True,
+        distributed_executor_backend="mp",
+    )
+    engram = EngramConfig(prefill_ple_provider="local")
+    engram.resolve_dp_shared_memory(parallel)
+    engram.verify_parallel_config(parallel)
+    assert not engram.dp_shared_memory
+    assert parallel.world_size == 4
+
+
 @pytest.mark.parametrize("target_has_ple", [False, True])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_engram_draft_config_validates_target(monkeypatch, target_has_ple, explicit):

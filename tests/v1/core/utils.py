@@ -68,7 +68,7 @@ def create_scheduler(
     long_prefill_token_threshold_adaptive: bool = False,
     disable_chunked_mm_input: bool = False,
     mm_encoder_only: bool = False,
-    use_kv_connector: None | bool | str | MockKVConfig = None,
+    use_kv_connector: None | bool | str | MockKVConfig | KVTransferConfig = None,
     kv_role: str = "kv_both",
     num_blocks: int = 10000,
     block_size: int = 16,
@@ -152,7 +152,9 @@ def create_scheduler(
         enable_prefix_caching=enable_prefix_caching,
     )
     kv_transfer_config = None
-    if isinstance(use_kv_connector, MockKVConfig):
+    if isinstance(use_kv_connector, KVTransferConfig):
+        kv_transfer_config = use_kv_connector
+    elif isinstance(use_kv_connector, MockKVConfig):
         kv_transfer_config = KVTransferConfig(
             kv_connector="MockKVConnector",
             kv_role=kv_role,

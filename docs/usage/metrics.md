@@ -57,6 +57,28 @@ only the GPU pool.
 
 --8<-- "gen:metrics-hisparse"
 
+## PLE transport
+
+Scheduler-side PLE exports these per-engine gauges with `model_name` and
+`engine` labels. The window covers the current and preceding 59 one-second
+buckets by completion time. Each scheduler snapshot reports zero for an empty
+window.
+
+| Prometheus gauge | Meaning |
+| --- | --- |
+| `vllm:ple_inflight_requests` | Current transports, including cancelled work still completing |
+| `vllm:ple_success_requests`, `vllm:ple_failed_requests` | Successful or failed transports in the window |
+| `vllm:ple_latency_ms`, `vllm:ple_latency_max_ms` | Mean and maximum successful transport time in milliseconds |
+| `vllm:ple_prepare_latency_ms`, `vllm:ple_fetch_latency_ms` | Mean time for each successful provider stage in milliseconds |
+
+Total transport time starts at hash submission and ends when fetched bytes
+have been validated. LocalProvider measures row validation and allocation as
+prepare, and the CPU gather as fetch. External providers can measure their
+corresponding SDK calls. READ acquisition, worker H2D, GPU forward and result
+release are outside the timer. A timeout counts once when transport settles.
+An earlier cancellation contributes to neither completion count. Successful
+stages contribute samples even if a later stage fails.
+
 ## Simple CPU Offload Connector Metrics
 
 These metrics are exposed when the `SimpleCPUOffloadConnector` KV connector

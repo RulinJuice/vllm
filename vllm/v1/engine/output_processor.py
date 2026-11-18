@@ -376,6 +376,8 @@ class RequestState:
                 self.external_req_id,
                 [self._new_pooling_output(pooling_output)],
                 finished,
+                kv_transfer_params,
+                ec_transfer_params,
                 error=error,
             )
 
@@ -420,6 +422,7 @@ class RequestState:
             finished,
             kv_transfer_params,
             ec_transfer_params,
+            error=error,
         )
 
     def _new_request_output(
@@ -470,6 +473,7 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
+            error=error,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
@@ -805,7 +809,7 @@ class OutputProcessor:
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
 
-            request_error = None
+            request_error = error
             if (
                 req_state.detokenizer is None
                 and engine_core_output.mm_cache_miss_hashes
@@ -816,6 +820,7 @@ class OutputProcessor:
                     message="Multi-modal processor cache miss.",
                     retryable=True,
                 )
+            if request_error is not None and req_state.detokenizer is None:
                 pooling_output = EMPTY_CPU_TENSOR
 
             if pooling_output is None:

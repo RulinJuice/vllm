@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import time
 from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
 from queue import Queue
+from tempfile import TemporaryDirectory
 from threading import Event
 
 import pytest
@@ -38,9 +40,10 @@ def _make_connector(tmp_path, table, pool_bytes=16, row_ids=None, **kwargs):
 
 def _wait_until(predicate):
     deadline = time.monotonic() + 5
-    while not predicate():
+    while not (value := predicate()):
         assert time.monotonic() < deadline, "Timed out waiting for PLE"
         time.sleep(0.001)
+    return value
 
 
 @pytest.mark.cpu_test
@@ -222,7 +225,8 @@ def test_ple_prepares_waiting_prompt_without_compute_capacity(
         output = scheduler.schedule()
         if remote_hit:
             assert waiting.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-            assert not prepared.is_set()
+            assert prepared.wait(5), "PLE should start before the KV receive finishes"
+            assert waiting.request_id not in output.ple_results
             partial.kv_connector_output = KVConnectorOutput(
                 finished_recving={waiting.request_id}
             )
@@ -251,20 +255,37 @@ def test_ple_prepares_waiting_prompt_without_compute_capacity(
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize(
     ("remote_hit", "prompt_len", "first_compute_token"),
-    [(0, 27, 16), (16, 27, 16), (32, 32, 31)],
+    [(0, 27, 16), (16, 27, 16), (32, 32, 31), (32, 40, 16)],
 )
-def test_ple_waits_for_kv_and_only_prepares_the_suffix(
+def test_ple_prefetches_only_the_suffix_and_gates_compute_on_kv(
     tmp_path, async_scheduling, remote_hit, prompt_len, first_compute_token
 ):
-    from .test_scheduler import _step_until_kv_transfer_finished, make_output
-    from .utils import create_requests, create_scheduler, mock_kv
+    from dataclasses import replace
+
+    from vllm.config import KVTransferConfig
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
+
+    from .test_scheduler import make_output
+    from .utils import create_requests, create_scheduler
 
     scheduler = create_scheduler(
         async_scheduling=async_scheduling,
         enable_prefix_caching=True,
+        # A full hit replays one real token even when drafts are configured.
+        num_speculative_tokens=2 if remote_hit == prompt_len else None,
         use_v2_model_runner=True,
         use_kv_connector=(
-            mock_kv(matched_tokens=remote_hit, is_async=True) if remote_hit else None
+            KVTransferConfig(
+                kv_connector="MockKVConnector",
+                kv_role="kv_both",
+                kv_load_failure_policy="recompute",
+                kv_connector_extra_config={
+                    "matched_tokens": remote_hit,
+                    "is_async": True,
+                },
+            )
+            if remote_hit
+            else None
         ),
     )
     warmup, request = create_requests(
@@ -288,19 +309,40 @@ def test_ple_waits_for_kv_and_only_prepares_the_suffix(
     try:
         scheduler.add_request(request)
         if remote_hit:
-            _step_until_kv_transfer_finished(scheduler, [request.request_id])
-            assert prepared == []
-
-        output = scheduler.schedule()
+            initial = scheduler.schedule()
+            assert initial.total_num_scheduled_tokens == 0 and not initial.ple_results
+            _wait_until(lambda: bool(prepared))
+            scheduler.update_from_output(initial, EMPTY_MODEL_RUNNER_OUTPUT)
+            waiting = scheduler.schedule()
+            assert waiting.total_num_scheduled_tokens == 0 and not waiting.ple_results
+            predicted = min(remote_hit, prompt_len - 1)
+            assert prepared == [(predicted, prompt_len)]
+            invalid_blocks = set()
+            if first_compute_token < predicted:
+                blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+                invalid_blocks.add(blocks[first_compute_token // scheduler.block_size])
+            scheduler.update_from_output(
+                waiting,
+                replace(
+                    EMPTY_MODEL_RUNNER_OUTPUT,
+                    kv_connector_output=KVConnectorOutput(
+                        finished_recving={request.request_id},
+                        invalid_block_ids=invalid_blocks,
+                    ),
+                ),
+            )
 
         def admitted():
-            nonlocal output
             output = scheduler.schedule()
-            return bool(output.num_scheduled_tokens)
+            return output if output.num_scheduled_tokens else None
 
-        _wait_until(admitted)
+        output = _wait_until(admitted)
         expected = (first_compute_token, prompt_len)
-        assert prepared == [expected]
+        if remote_hit and first_compute_token < min(remote_hit, prompt_len - 1):
+            assert prepared == [(min(remote_hit, prompt_len - 1), prompt_len), expected]
+        else:
+            assert prepared == [expected]
+        assert not output.scheduled_spec_decode_tokens
         assert output.num_scheduled_tokens == {
             request.request_id: prompt_len - first_compute_token
         }
@@ -312,6 +354,13 @@ def test_ple_waits_for_kv_and_only_prepares_the_suffix(
         scheduler.shutdown()
 
 
+@pytest.fixture
+def ple_shm_dir():
+    # CUDA host registration of file-backed pages depends on the filesystem.
+    with TemporaryDirectory(dir="/dev/shm") as directory:
+        yield Path(directory)
+
+
 @pytest.mark.skipif(
     torch.version.cuda is None or not torch.cuda.is_available(), reason="CUDA required"
 )
@@ -319,7 +368,7 @@ def test_ple_waits_for_kv_and_only_prepares_the_suffix(
 @pytest.mark.parametrize("registration", ["pool", "region"])
 @pytest.mark.parametrize("transport", ["path", "fd"])
 def test_reader_stages_packed_chunks_and_padding(
-    tmp_path, use_graph, registration, transport
+    ple_shm_dir, use_graph, registration, transport
 ):
     import os
     from dataclasses import replace
@@ -330,7 +379,7 @@ def test_reader_stages_packed_chunks_and_padding(
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
     table = torch.arange(16, dtype=torch.uint8).view(8, 2)
-    connector = _make_connector(tmp_path, table)
+    connector = _make_connector(ple_shm_dir, table)
     rows = torch.zeros((4, 1), device="cuda", dtype=torch.bfloat16)
     ready = torch.cuda.Event(external=True)
     ready.record()
@@ -419,13 +468,15 @@ class DeferredRemoteProvider:
             Queue()
         )
         self.released = []
-        self.fail_release_once = False
+        self.producing = {}
+        self.release_error = None
 
     def export_pool(self, num_workers):
         return self.storage.export_pool(num_workers)
 
     def prepare(self, result_id, row_ids):
         future: Future[PreparedRows] = Future()
+        self.producing[result_id] = future
         self.submissions.put((result_id, row_ids, future))
         return future
 
@@ -434,13 +485,20 @@ class DeferredRemoteProvider:
         future.set_result(self.storage.prepare(result_id, row_ids).result(5))
 
     def release(self, result_id):
-        if self.fail_release_once:
-            self.fail_release_once = False
+        if self.release_error is not None:
+            error, self.release_error = self.release_error, None
             failed: Future[None] = Future()
-            failed.set_exception(RuntimeError("temporary READ release failure"))
+            failed.set_exception(error)
             return failed
-        self.released.append(result_id)
-        return self.storage.release(result_id)
+        released: Future[None] = Future()
+
+        def release_rows(_):
+            self.storage.release(result_id).result()
+            self.released.append(result_id)
+            released.set_result(None)
+
+        self.producing.pop(result_id).add_done_callback(release_rows)
+        return released
 
     def close(self):
         self.storage.close()
@@ -469,18 +527,18 @@ def test_background_prepare_and_cleanup_do_not_wait_for_scheduler(tmp_path, fail
             # No result was delivered. SDK drain is intentionally never signalled.
             first[2].set_exception(RuntimeError("SDK fetch failed"))
             with pytest.raises(RuntimeError, match="SDK fetch failed"):
-                connector.ensure_ready("first", [1, 2], 0)
+                _wait_until(lambda: connector.ensure_ready("first", [1, 2], 0))
             connector.finish("first")
         else:
             rows = provider.storage.prepare(first[0], first[1]).result(5)
             first[2].set_result(replace(rows, pool_id="stale-generation"))
             with pytest.raises(RuntimeError, match="invalid PLE result"):
-                connector.ensure_ready("first", [1, 2], 0)
-            provider.fail_release_once = True
+                _wait_until(lambda: connector.ensure_ready("first", [1, 2], 0))
+            provider.release_error = RuntimeError("temporary READ release failure")
             connector.finish("first")
             assert connector.has_cleanup
         provider.succeed(second)
-        assert connector.ensure_ready("second", [3, 4], 0)
+        _wait_until(lambda: connector.ensure_ready("second", [3, 4], 0))
         _wait_until(lambda: (connector.poll(), not connector.has_cleanup)[1])
         assert first[0] in provider.released
     finally:
@@ -491,7 +549,7 @@ def test_background_prepare_and_cleanup_do_not_wait_for_scheduler(tmp_path, fail
 
 
 @pytest.mark.cpu_test
-def test_cancel_during_hash_still_releases_late_production(tmp_path):
+def test_cancel_during_hash_skips_provider_submission(tmp_path):
     started, proceed = Event(), Event()
     provider = DeferredRemoteProvider(tmp_path)
 
@@ -503,23 +561,106 @@ def test_cancel_during_hash_still_releases_late_production(tmp_path):
     connector = _make_connector(
         tmp_path, provider, row_ids=hash_ids, max_preparations=1
     )
-    submission = None
     try:
         connector.ensure_ready("first", [1, 2], 0)
         assert started.wait(5)
         connector.finish("first")
         assert not connector.ensure_ready("next", [3, 4], 0)
         proceed.set()
-        submission = provider.submissions.get(timeout=5)
-        provider.succeed(submission)
         _wait_until(lambda: (connector.poll(), not connector.has_cleanup)[1])
-        assert provider.released == [submission[0]]
+        assert provider.submissions.empty()
+        connector.ensure_ready("next", [3, 4], 0)
+        next_lookup = provider.submissions.get(timeout=5)
+        assert next_lookup[1].tolist() == [3, 4]
+        provider.succeed(next_lookup)
+        _wait_until(lambda: connector.ensure_ready("next", [3, 4], 0))
     finally:
         proceed.set()
-        if submission is None:
-            submission = provider.submissions.get(timeout=5)
-            provider.succeed(submission)
         connector.close()
+
+
+@pytest.mark.cpu_test
+def test_cancel_pool_waiter_allows_a_smaller_request_to_run(tmp_path):
+    # Keep A live and unacknowledged. Only C fits in the remaining half-pool.
+    table = torch.arange(16, dtype=torch.uint8).view(8, 2)
+    c_hashed = Event()
+
+    def row_ids(tokens, start):
+        if tokens[0] == 6:
+            c_hashed.set()
+        return torch.tensor(tokens[start:])
+
+    connector = _make_connector(tmp_path, table, 8, row_ids, timeout=1)
+    try:
+        _wait_until(lambda: connector.ensure_ready("a", [0, 1], 0))
+        connector.dispatch("a")
+        connector.ensure_ready("b", [2, 3, 4, 5], 0)
+        connector.ensure_ready("c", [6], 0)
+        assert c_hashed.wait(5)  # B's provider submission has returned.
+        connector.finish("b")
+        _wait_until(lambda: connector.ensure_ready("c", [6], 0))
+        assert connector.dispatch("c").rows.chunks[0].nbytes == 2
+    finally:
+        connector.close(consumers_stopped=True)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "error", [TimeoutError("read deadline"), asyncio.CancelledError()]
+)
+@pytest.mark.parametrize("synchronous", [False, True])
+def test_sdk_error_reaches_client_on_zero_token_step(tmp_path, error, synchronous):
+    from vllm.v1.engine import FinishReason
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+
+    from .utils import create_requests, create_scheduler
+
+    scheduler = create_scheduler(max_num_seqs=1, use_v2_model_runner=True)
+
+    class FailingProvider(DeferredRemoteProvider):
+        fail_first = synchronous
+
+        def prepare(self, result_id, row_ids):
+            future = super().prepare(result_id, row_ids)
+            if self.fail_first:
+                self.fail_first = False
+                future.set_exception(error)
+                raise error
+            return future
+
+    provider = FailingProvider(tmp_path)
+    connector = _make_connector(tmp_path, provider, max_preparations=1)
+    scheduler.ple_connector = connector
+    (request,) = create_requests(num_requests=1, num_tokens=4, max_tokens=1)
+    try:
+        scheduler.add_request(request)
+        step = scheduler.schedule()
+        lookup = provider.submissions.get(timeout=5)
+        scheduler.update_from_output(step, EMPTY_MODEL_RUNNER_OUTPUT)
+        if not synchronous:
+            lookup[2].set_exception(error)
+
+        def reply_without_forward():
+            step = scheduler.schedule()
+            assert step.total_num_scheduled_tokens == 0
+            outputs = scheduler.update_from_output(step, EMPTY_MODEL_RUNNER_OUTPUT)
+            return (
+                outputs[request.client_index].outputs
+                if request.client_index in outputs
+                else None
+            )
+
+        (reply,) = _wait_until(reply_without_forward)
+        assert reply.finish_reason == FinishReason.ERROR and reply.new_token_ids == []
+        assert reply.error.code == "ple_lookup_failed"
+        assert reply.error.retryable == isinstance(error, TimeoutError)
+        _wait_until(lambda: (connector.poll(), not connector.has_cleanup)[1])
+        connector.ensure_ready("next", [1], 0)
+        next_lookup = provider.submissions.get(timeout=5)
+        provider.succeed(next_lookup)
+        _wait_until(lambda: connector.ensure_ready("next", [1], 0))
+    finally:
+        scheduler.shutdown()
 
 
 @pytest.mark.cpu_test
@@ -585,6 +726,331 @@ def test_timeout_retains_cleanup_until_late_success(tmp_path):
     finally:
         if submission is not None and not submission[2].done():
             provider.succeed(submission)
+        connector.close()
+
+
+@pytest.mark.cpu_test
+def test_deadline_applies_to_completion_and_restarts_on_coverage_rollback(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.ple import connector as module
+
+    now = 0.0
+    monkeypatch.setattr(module, "monotonic", lambda: now)
+    provider = DeferredRemoteProvider(tmp_path)
+    connector = _make_connector(tmp_path, provider, timeout=2)
+    tokens = [1, 2, 3, 4]
+    try:
+        connector.prefetch("req", tokens, 3)
+        first = provider.submissions.get(timeout=5)
+        # Serialize with the hash executor so the callback is installed before
+        # completing the future at the chosen clock value.
+        connector.prefetch("late", tokens, 1)
+        late = provider.submissions.get(timeout=5)
+        now = 1.0
+        provider.succeed(first)
+        now = 3.0
+        provider.succeed(late)
+        assert connector.ensure_ready("req", tokens, 3)
+        with pytest.raises(TimeoutError):
+            connector.ensure_ready("late", tokens, 1)
+        connector.finish("late")
+
+        # The KV transfer supplied less than predicted. The old generation's
+        # deadline has expired; the replacement starts with its own deadline.
+        assert not connector.ensure_ready("req", tokens, 1)
+        replacement = provider.submissions.get(timeout=5)
+        assert replacement[0] != first[0] and replacement[1].tolist() == [2, 3, 4]
+        provider.succeed(replacement)
+        _wait_until(lambda: connector.ensure_ready("req", tokens, 2))
+        assert connector.dispatch("req").start == 1
+    finally:
+        for future in list(provider.producing.values()):
+            if not future.done():
+                future.set_exception(RuntimeError("test ended"))
+        connector.close(consumers_stopped=True)
+
+
+@pytest.mark.cpu_test
+def test_shutdown_reports_outstanding_result_and_can_retry(tmp_path):
+    from .utils import create_scheduler
+
+    provider = DeferredRemoteProvider(tmp_path)
+    connector = _make_connector(tmp_path, provider)
+    scheduler = create_scheduler(use_v2_model_runner=True)
+    scheduler.ple_connector = connector
+    lookup = None
+    try:
+        connector.prefetch("slow", [1], 0)
+        lookup = provider.submissions.get(timeout=5)
+        connector.finish("slow")
+        assert scheduler.has_requests()
+        connector.begin_shutdown()
+        assert not scheduler.has_requests()
+        with pytest.raises(TimeoutError, match=lookup[0]):
+            connector.close(timeout=0)
+        assert Path(connector.reader_config.pool.path).exists()
+        assert not lookup[2].cancelled()
+        provider.succeed(lookup)
+        connector.close()
+        assert provider.released == [lookup[0]]
+        assert not Path(connector.reader_config.pool.path).exists()
+    finally:
+        if lookup is not None and not lookup[2].done():
+            provider.succeed(lookup)
+        scheduler.shutdown()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("synchronous", [True, False])
+def test_cancelled_release_is_retried(tmp_path, monkeypatch, synchronous):
+    provider = DeferredRemoteProvider(tmp_path)
+    connector = _make_connector(tmp_path, provider, max_preparations=1)
+    release = provider.release
+    attempts = []
+
+    def release_once(result_id):
+        attempts.append(result_id)
+        if len(attempts) == 1:
+            if synchronous:
+                raise asyncio.CancelledError()
+            provider.release_error = asyncio.CancelledError()
+        return release(result_id)
+
+    monkeypatch.setattr(provider, "release", release_once)
+    try:
+        connector.prefetch("req", [1], 0)
+        lookup = provider.submissions.get(timeout=5)
+        provider.succeed(lookup)
+        _wait_until(lambda: connector.ensure_ready("req", [1], 0))
+        connector.finish("req")
+        _wait_until(lambda: (connector.poll(), not connector.has_cleanup)[1])
+        assert attempts == [lookup[0], lookup[0]]
+        assert provider.released == [lookup[0]]
+    finally:
+        connector.close()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_partial_reader_initialization_keeps_pool_until_workers_stop(
+    tmp_path, stop_fails
+):
+    import mmap
+
+    from vllm.config import VllmConfig
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+    connector = _make_connector(tmp_path, torch.arange(8, dtype=torch.uint8).view(4, 2))
+    path = Path(connector.reader_config.pool.path)
+
+    class FailingWorkerGroup(UniProcExecutor):
+        def _init_executor(self):
+            self.mapping = None
+
+        def collective_rpc(self, method, *, args):
+            assert method == "initialize_ple_reader"
+            (config,) = args
+            with open(config.pool.path, "r+b") as pool:
+                self.mapping = mmap.mmap(pool.fileno(), config.pool.size)
+            raise RuntimeError("another worker failed")
+
+        def shutdown(self):
+            assert path.exists() and self.mapping is not None
+            if stop_fails:
+                raise RuntimeError("worker still alive")
+            self.mapping.close()
+
+    group = FailingWorkerGroup(VllmConfig())
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="worker still alive" if stop_fails else "another worker failed",
+        ):
+            group.initialize_ple_readers(connector)
+        assert path.exists() == stop_fails
+        assert group.mapping is not None and group.mapping.closed != stop_fails
+    finally:
+        if group.mapping is not None:
+            group.mapping.close()
+        connector.close(consumers_stopped=True)
+
+
+@pytest.mark.cpu_test
+def test_queued_local_work_can_be_withdrawn_while_pool_is_full(tmp_path):
+    table = torch.arange(8, dtype=torch.uint8).view(4, 2)
+    pool = LocalPLEProvider(table, pool_bytes=2, directory=str(tmp_path))
+    try:
+        pool.prepare("held", torch.tensor([0])).result(5)
+        waiting = pool.prepare("waiting", torch.tensor([1]))
+        queued = pool.prepare("queued", torch.tensor([2]))
+        pool.release("queued").result(5)
+        with pytest.raises(RuntimeError, match="withdrawn"):
+            queued.result()
+        assert not waiting.done()
+        pool.release("held").result(5)
+        assert waiting.result(5).result_id == "waiting"
+    finally:
+        pool.close()
+
+
+@pytest.fixture(scope="module")
+def qwen4_ple_checkpoint(tmp_path_factory):
+    from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
+
+    path = tmp_path_factory.mktemp("qwen4-ple")
+    config = Qwen4ExpTextConfig(
+        output_gate_type="sigmoid",
+        vocab_size=256,
+        hidden_size=128,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        hc_count=4,
+        hc_lowrank=16,
+        ple_layer_ids=[1],
+        ple_embed_dim=128,
+        ngram_size=2,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=17,
+        make_ngram_vocab_size_divisible_by=8,
+        split_ngram_parts=2,
+        eos_token_id=1,
+        max_position_embeddings=64,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        Qwen4ExpForCausalLM(config).to(torch.bfloat16).save_pretrained(path)
+    return str(path)
+
+
+@pytest.mark.skipif(
+    torch.version.cuda is None or not torch.cuda.is_available(), reason="CUDA required"
+)
+@pytest.mark.parametrize(
+    ("role", "mtp", "supported"),
+    [("kv_producer", True, True), (None, True, False), ("kv_consumer", False, False)],
+)
+def test_qwen4_ple_config_enforces_prefill_role(
+    qwen4_ple_checkpoint, monkeypatch, role, mtp, supported
+):
+    from vllm.config import KVTransferConfig
+    from vllm.engine.arg_utils import EngineArgs
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    args = EngineArgs(
+        model=qwen4_ple_checkpoint,
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        max_model_len=32,
+        hf_overrides={"mtp_num_hidden_layers": 1},
+        engram_config={"prefill_ple_provider": "local"},
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="ExampleConnector", kv_role=role
+        )
+        if role
+        else None,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1}
+        if mtp
+        else None,
+    )
+    if supported:
+        resolved = args.create_engine_config()
+        assert (
+            resolved.speculative_config.draft_model_config.architecture == "Qwen4ExpMTP"
+        )
+        assert resolved.load_config.safetensors_load_strategy == "lazy"
+    else:
+        with pytest.raises(ValueError, match="prefill producer"):
+            args.create_engine_config()
+
+
+@pytest.mark.skipif(
+    torch.version.cuda is None or not torch.cuda.is_available(), reason="CUDA required"
+)
+def test_llm_generates_after_a_ple_lookup_error(
+    qwen4_ple_checkpoint, vllm_runner, monkeypatch
+):
+    from vllm import SamplingParams
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    with vllm_runner(
+        qwen4_ple_checkpoint,
+        dtype="bfloat16",
+        enforce_eager=True,
+        skip_tokenizer_init=True,
+        enable_prefix_caching=False,
+        max_model_len=32,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        disable_log_stats=False,
+        gpu_memory_utilization=0.01,
+        kv_cache_memory_bytes=32 << 20,
+        engram_config={
+            "prefill_ple_provider": "local",
+            "prefill_ple_provider_options": {"pool_bytes": 512},
+        },
+    ) as runner:
+        params = SamplingParams(max_tokens=1, temperature=0, logprobs=1)
+        # One token needs 256 bytes of rows. Three exceed the pool; two fit.
+        (failed,) = runner.llm.generate({"prompt_token_ids": [2, 3, 4]}, params)
+        assert failed.finished and failed.error.code == "ple_lookup_failed"
+        assert (
+            failed.outputs[0].finish_reason == "error"
+            and not failed.outputs[0].token_ids
+        )
+        (ok,) = runner.llm.generate({"prompt_token_ids": [2, 3]}, params)
+        assert ok.finished and ok.error is None and len(ok.outputs[0].token_ids) == 1
+        from vllm.v1.metrics.reader import Gauge
+
+        gauges = {
+            m.name: m.value for m in runner.llm.get_metrics() if isinstance(m, Gauge)
+        }
+        assert (
+            gauges["vllm:ple_failed_requests"]
+            == gauges["vllm:ple_success_requests"]
+            == 1
+        )
+        assert gauges["vllm:ple_inflight_requests"] == 0
+        assert gauges["vllm:ple_latency_ms"] == gauges["vllm:ple_latency_max_ms"] > 0
+
+
+@pytest.mark.cpu_test
+def test_remote_read_failure_after_transport_success_is_not_a_fetch_failure(tmp_path):
+    class ObservedRemote(DeferredRemoteProvider):
+        def prepare(self, result_id, row_ids, *, observation=None):
+            assert observation is not None
+            self.observation = observation
+            return super().prepare(result_id, row_ids)
+
+    provider = ObservedRemote(tmp_path)
+    connector = _make_connector(tmp_path, provider)
+    try:
+        connector.prefetch("failed-read", [1], 0)
+        lookup = provider.submissions.get(timeout=5)
+        assert connector.metrics.snapshot()["ple_inflight_requests"] == 1
+        provider.observation.finish()  # Valid local bytes, READ still outstanding.
+        assert not connector.ensure_ready("failed-read", [1], 0)
+        lookup[2].set_exception(RuntimeError("READ acquire failed"))
+        with pytest.raises(RuntimeError, match="READ acquire failed"):
+            _wait_until(lambda: connector.ensure_ready("failed-read", [1], 0))
+        connector.finish("failed-read")
+        _wait_until(lambda: (connector.poll(), not connector.has_cleanup)[1])
+        stats = connector.metrics.snapshot()
+        assert stats["ple_success_requests"] == 1
+        assert stats["ple_failed_requests"] == stats["ple_inflight_requests"] == 0
+        assert provider.released == [lookup[0]]
+    finally:
         connector.close()
 
 

@@ -5,11 +5,12 @@ process while workers compute other requests. A provider owns the table access
 and result storage. The common connector handles hashing, request lifetimes and
 scheduling; the common reader maps local storage and performs H2D.
 
-This is opt-in. The supported scope is Linux CUDA, ModelRunner V2, one Qwen4Exp
-PLE table, BF16 or global FP8 checkpoint rows, and single-node TP with one DP,
-PP and context-parallel rank. Requests are text-only with `max_tokens=1`;
-speculative decoding and weight reload are unsupported. Decode keeps its normal
-backend. See [configuration](../features/engram.md#scheduler-side-prefill-qwen4exp).
+This is opt-in for Linux CUDA, ModelRunner V2 and one BF16 or global FP8
+Qwen4Exp PLE table. Each single-node engine (PP=1) owns its provider and pool.
+Its TP and context-parallel workers consume rank-local token segments. The
+model and runner's normal topology restrictions apply. Text prefill requests
+use `max_tokens=1`. A KV producer can also configure Qwen4 MTP. See the
+[configuration guide](../features/engram.md#scheduler-side-prefill-qwen4exp).
 
 ## Responsibilities
 
@@ -37,15 +38,17 @@ sequenceDiagram
     participant W as TP workers / Reader
 
     Note over C,W: Startup: export stable pool, map once in each worker
-    K-->>S: KV load confirmed, if needed
-    S->>C: ensure_ready(request, tokens, first_compute_token)
+    K-->>S: Expected reusable prefix (async KV hit)
+    S->>C: prefetch(request, tokens, expected_start)
+    Note over K,P: KV transfer and PLE lookup may proceed concurrently
     C->>C: Background CPU hash, preserving order and duplicates
     C->>P: prepare(result_id, row_ids)
     P-->>C: Pending Future
     Note over S,W: Other requests may compute during preparation
     P->>P: Fetch, acquire local ownership and validate
     P-->>C: Future succeeds with PreparedRows
-    S->>C: ensure_ready / dispatch on next admission
+    K-->>S: KV load completes with actual coverage
+    S->>C: ensure_ready(actual_start), then dispatch
     C-->>S: Token range + PreparedRows
     S->>W: SchedulerOutput.ple_results
     W->>W: Register if needed, H2D on copy stream
@@ -65,11 +68,12 @@ worker bypass notification or new EngineCore event loop.
 
 ## KV coverage and admission
 
-`ensure_ready()` runs in the waiting-request loop after the usable KV frontier
-is established. With PLE enabled, that loop continues preparing waiting requests
-even when token budget or running slots are exhausted. External KV must finish
-its separate asynchronous load phase before preparation starts; a synchronous
-external hit returns a request error.
+When a native lookup selects asynchronous KV loading, the scheduler calls
+`prefetch()` with the expected first compute position before allocating KV
+blocks. Local KV hits start preparation when the scheduler first considers the
+request, even with an exhausted token budget or no free running slots. At GPU
+admission, `ensure_ready()` checks the actual KV frontier and the result. A
+synchronous external hit returns a request error.
 
 The prepared range is the complete suffix `[first_compute_token, prompt_len)`.
 For an 8,192-token prompt with 6,144 reusable tokens, prepare the remaining
@@ -78,13 +82,13 @@ requires last-token replay prepares that last token.
 
 Before admission, the scheduler revalidates the KV frontier. A later frontier
 can use a subset of an existing result. A backwards move retires that result
-and prepares a new generation. Chunked prefill and preemption retain a valid
+and prepares a new generation with a fresh deadline. Chunked prefill and preemption retain a valid
 result; each scheduled step carries its descriptor and the current token range.
 
 `prefill_ple_max_preparations` bounds retained results by count, including
 pending, ready and retiring results. `prefill_ple_timeout` bounds admission and
-production. Completion time is recorded in the callback, so a result that
-completed on time is not timed out merely because scheduling resumed later.
+production. The completion callback checks the deadline before publishing the
+result. A timely result can be dispatched on a later scheduling pass.
 LocalProvider handles pool capacity and fragmented free space internally.
 
 ## Provider contract
@@ -118,8 +122,9 @@ Failure ownership is explicit:
 - After a provider obtains a result, it retains the result and acquired read
   references under `result_id`, including when later acquisition or validation
   fails. `release()` cleans them up and can be retried.
-- Cancellation and timeout do not cancel production Futures. Connector retains
-  cleanup state for late success and releases it without dispatch.
+- Cancellation withdraws queued hashing or a local pool wait. If submission has
+  reached the provider, `release()` can run while preparation is pending. The
+  Connector retains cleanup state for a late success.
 - Once dispatched, release requires every consuming rank to confirm its final
   H2D and drop local use. A missing rank never counts as acknowledgment.
 - Release failures retain the cleanup entry and retry with bounded backoff.
@@ -151,7 +156,12 @@ Reader reports an ID only after its final H2D event completes and local use is
 released. `ModelRunnerOutput.ple_consumed_result_ids` is intersected across all
 ranks alongside existing KV/EC output aggregation. Repeated retirement IDs are
 safe. The engine continues cleanup after the last request finishes. Shutdown
-stops workers before releasing provider storage.
+stops workers before releasing provider storage, including a partial Reader startup
+failure. After worker teardown, cleanup uses the worker shutdown timeout. On expiry
+the Connector reports outstanding result IDs and retains ownership for a retry.
+
+Transport timestamps and the per-engine Prometheus gauges are documented in
+[PLE transport metrics](../usage/metrics.md#ple-transport).
 
 ## Validation
 

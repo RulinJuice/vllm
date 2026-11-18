@@ -203,27 +203,7 @@ class EngineCore:
         )
         self.scheduler: SchedulerInterface = scheduler
         self._initialize_effective_attention_block_size()
-        engram = vllm_config.engram_config
-        if engram is not None and engram.prefill_ple_enabled:
-            from vllm.v1.core.sched.scheduler import Scheduler
-            from vllm.v1.ple.output import PLEOutputAggregator
-            from vllm.v1.ple.qwen4 import load_qwen4_connector
-
-            if not isinstance(scheduler, Scheduler):
-                raise ValueError("Scheduler-side PLE requires the V1 scheduler")
-            ple_connector = load_qwen4_connector(vllm_config)
-            try:
-                self.model_executor.collective_rpc(
-                    "initialize_ple_reader", args=(ple_connector.reader_config,)
-                )
-            except BaseException:
-                ple_connector.close()
-                raise
-            self.ple_connector = ple_connector
-            scheduler.ple_connector = ple_connector
-            self.model_executor.ple_output_aggregator = PLEOutputAggregator(
-                vllm_config.parallel_config.world_size
-            )
+        self._initialize_ple_connector()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -729,6 +709,19 @@ class EngineCore:
         """Whether to defer new prefills this step (DP prefill balancing).
         Overridden by the DP engine core; never throttles otherwise."""
         return False
+
+    def _initialize_ple_connector(self) -> None:
+        engram = self.vllm_config.engram_config
+        if engram is None or not engram.prefill_ple_enabled:
+            return
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.ple.qwen4 import load_qwen4_connector
+
+        if not isinstance(self.scheduler, Scheduler):
+            raise ValueError("Scheduler-side PLE requires the V1 scheduler")
+        ple_connector = load_qwen4_connector(self.vllm_config)
+        self.ple_connector = self.scheduler.ple_connector = ple_connector
+        self.model_executor.initialize_ple_readers(ple_connector)
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -1873,6 +1866,8 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
+            if self.ple_connector is not None:
+                self.ple_connector.begin_shutdown()
             shutdown_timeout = self.vllm_config.shutdown_timeout
             mode = "abort" if shutdown_timeout == 0 else "drain"
 

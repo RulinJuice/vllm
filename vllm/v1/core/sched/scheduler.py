@@ -1272,13 +1272,22 @@ class Scheduler(SchedulerInterface):
                         num_computed_tokens = 0
                         load_kv_async = False
 
-                    # Include encoder inputs needed to replay the prefix tail.
-                    ec_computed_tokens = num_computed_tokens
+                    # Both encoder inputs and PLE must cover a replayed prefix tail.
+                    effective_computed_tokens = num_computed_tokens
                     if not window_loaded:
-                        ec_computed_tokens = max(
+                        effective_computed_tokens = max(
                             0, num_computed_tokens - self.prefix_replay_tokens
                         )
-                    if self._ec_transfer_pending(request, ec_computed_tokens):
+                    if load_kv_async and self.ple_connector is not None:
+                        assert request.prompt_token_ids is not None
+                        self.ple_connector.prefetch(
+                            request_id,
+                            request.prompt_token_ids,
+                            min(
+                                effective_computed_tokens, request.num_prompt_tokens - 1
+                            ),
+                        )
+                    if self._ec_transfer_pending(request, effective_computed_tokens):
                         skip_request(request_queue)
                         continue
 
@@ -1349,33 +1358,9 @@ class Scheduler(SchedulerInterface):
                         )
                         num_computed_tokens -= num_replay_tokens
                     if self.ple_connector is not None:
-                        # This runs after APC and after asynchronous KV receive.
-                        # A synchronous external hit needs this step to load KV.
-                        if num_external_computed_tokens:
-                            self.ple_request_errors[request_id] = RequestError(
-                                code="validation_error",
-                                message=(
-                                    "Scheduler-side PLE requires asynchronous KV loads"
-                                ),
-                            )
-                        if request_id in self.ple_request_errors:
-                            skip_request(request_queue)
-                            continue
-                        assert request.prompt_token_ids is not None
-                        try:
-                            ple_ready = self.ple_connector.ensure_ready(
-                                request_id,
-                                request.prompt_token_ids,
-                                num_computed_tokens,
-                            )
-                        except (ValueError, RuntimeError, TimeoutError) as exc:
-                            self.ple_request_errors[request_id] = RequestError(
-                                code="ple_lookup_failed",
-                                message=str(exc),
-                                retryable=isinstance(exc, TimeoutError),
-                            )
-                            ple_ready = False
-                        if not ple_ready:
+                        if not self._ple_rows_ready(
+                            request, num_computed_tokens, num_external_computed_tokens
+                        ):
                             skip_request(request_queue)
                             continue
                         if (
@@ -1401,6 +1386,8 @@ class Scheduler(SchedulerInterface):
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
+                        # Staged rows only cover actual prompt tokens.
+                        and self.ple_connector is None
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
@@ -1817,15 +1804,6 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
-            ple_results={
-                req_id: self.ple_connector.dispatch(req_id)
-                for req_id in num_scheduled_tokens
-            }
-            if self.ple_connector is not None
-            else {},
-            ple_retire_ids=self.ple_connector.retire_ids()
-            if self.ple_connector is not None
-            else set(),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1851,6 +1829,9 @@ class Scheduler(SchedulerInterface):
             skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+
+        if self.ple_connector is not None:
+            self.ple_connector.update_scheduler_output(scheduler_output)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -2793,6 +2774,31 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    def _ple_rows_ready(
+        self, request: Request, start: int, synchronous_external_tokens: int
+    ) -> bool:
+        """Recheck actual KV coverage before admitting this request to compute."""
+        req_id = request.request_id
+        if synchronous_external_tokens:
+            self.ple_request_errors[req_id] = RequestError(
+                code="validation_error",
+                message="Scheduler-side PLE requires asynchronous KV loads",
+            )
+        if req_id in self.ple_request_errors:
+            return False
+        assert self.ple_connector is not None and request.prompt_token_ids is not None
+        try:
+            return self.ple_connector.ensure_ready(
+                req_id, request.prompt_token_ids, start
+            )
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            self.ple_request_errors[req_id] = RequestError(
+                code="ple_lookup_failed",
+                message=str(exc),
+                retryable=isinstance(exc, TimeoutError),
+            )
+            return False
+
     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
         """Whether an encoder input this request needs is still in transit."""
         return (
@@ -3328,7 +3334,7 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
-            or (self.ple_connector is not None and self.ple_connector.has_cleanup)
+            or (self.ple_connector is not None and self.ple_connector.needs_engine_step)
             or (self.connector is not None and self.connector.has_pending_push_work())
             or (
                 self.ec_connector is not None
@@ -3446,6 +3452,9 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
+            ple_metrics=self.ple_connector.metrics.snapshot()
+            if self.ple_connector
+            else {},
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

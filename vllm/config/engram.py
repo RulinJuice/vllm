@@ -144,6 +144,7 @@ class EngramConfig:
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
                 self.cpu_offload
+                and not self.prefill_ple_enabled
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
@@ -153,15 +154,12 @@ class EngramConfig:
         """Reject unsupported embedding parallel topologies."""
         if self.prefill_ple_enabled and (
             parallel_config.nnodes != 1
-            or parallel_config.data_parallel_size != 1
             or parallel_config.pipeline_parallel_size != 1
-            or parallel_config.prefill_context_parallel_size != 1
-            or parallel_config.decode_context_parallel_size != 1
             or parallel_config.enable_elastic_ep
             or parallel_config.distributed_executor_backend not in ("mp", "uni")
         ):
             raise ValueError(
-                "Scheduler-side PLE requires single-node TP with mp or uni"
+                "Scheduler-side PLE requires PP=1 and single-node mp or uni workers"
             )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
@@ -188,4 +186,8 @@ class EngramConfig:
 
     def compute_hash(self) -> str:
         """Hash settings that affect embedding execution and graph structure."""
-        return hash_factors(get_hash_factors(self, set()))
+        return hash_factors(
+            get_hash_factors(
+                self, {"prefill_ple_timeout", "prefill_ple_max_preparations"}
+            )
+        )

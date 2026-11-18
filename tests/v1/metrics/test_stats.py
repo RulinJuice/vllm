@@ -6,6 +6,7 @@ import pytest
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics.ple import PLEMetrics
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -18,6 +19,58 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.utils import compute_iteration_details
+
+
+def test_ple_transport_window_and_abandonment():
+    now = 0.0
+    metrics = PLEMetrics(clock=lambda: now)
+    successful = metrics.begin(deadline=10)
+    abandoned = metrics.begin(deadline=2)
+    late = metrics.begin(deadline=2)
+    assert metrics.snapshot()["ple_inflight_requests"] == 3
+    with successful.measure("prepare"):
+        now = 0.25
+    with successful.measure("fetch"):
+        now = 0.75
+    successful.finish()
+    abandoned.abandon()
+    now = 3.0
+    late.abandon()  # The deadline expired first.
+    assert metrics.snapshot()["ple_inflight_requests"] == 2
+    late.finish(TimeoutError())
+    abandoned.finish()
+    late.finish()  # A late callback or release cannot settle the same attempt twice.
+    assert metrics.snapshot() == {
+        "ple_latency_ms": 750,
+        "ple_latency_max_ms": 750,
+        "ple_prepare_latency_ms": 250,
+        "ple_fetch_latency_ms": 500,
+        "ple_inflight_requests": 0,
+        "ple_success_requests": 1,
+        "ple_failed_requests": 1,
+    }
+    now = 60.0
+    assert metrics.snapshot()["ple_success_requests"] == 0
+    assert metrics.snapshot()["ple_failed_requests"] == 1
+    now = 63.0
+    assert not any(metrics.snapshot().values())
+
+
+def test_ple_stage_samples_survive_fetch_failure():
+    now = 0.0
+    metrics = PLEMetrics(clock=lambda: now)
+    lookup = metrics.begin(deadline=5)
+    with lookup.measure("prepare"):
+        now = 0.125
+    with pytest.raises(RuntimeError), lookup.measure("fetch"):
+        now = 0.5
+        raise RuntimeError("fetch failed")
+    lookup.finish(RuntimeError("fetch failed"))
+    result = metrics.snapshot()
+    assert result["ple_failed_requests"] == 1
+    assert result["ple_success_requests"] == result["ple_inflight_requests"] == 0
+    assert result["ple_prepare_latency_ms"] == 125
+    assert result["ple_fetch_latency_ms"] == result["ple_latency_ms"] == 0
 
 
 def test_iteration_stats_repr():

@@ -253,6 +253,7 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+    ple_metrics: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
